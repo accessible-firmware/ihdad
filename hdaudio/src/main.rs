@@ -1,12 +1,13 @@
 #![allow(dead_code)]
+#![feature(uefi_std)]
 
 mod hda;
 mod pcid;
+mod efidma;
 
 
 use pcid::*;
 use crate::state::*;
-use std::borrow::BorrowMut;
 
 
 
@@ -60,7 +61,7 @@ fn get_int_method(pcid_handle: &mut PcidServerHandle) -> Option<File> {
     if msi_enabled && !msix_enabled {
         use pcid::msi::x86_64::{DeliveryMode, self as x86_64_msix};
 
-        let capability = match pcid_handle.feature_info(PciFeature::Msi).expect("ihdad: failed to retrieve the MSI capability structure from pcid") {
+        let _capability = match pcid_handle.feature_info(PciFeature::Msi).expect("ihdad: failed to retrieve the MSI capability structure from pcid") {
             PciFeatureInfo::Msi(s) => s,
             PciFeatureInfo::MsiX(_) => std::panic!(),
         };
@@ -101,6 +102,8 @@ fn get_int_method(pcid_handle: &mut PcidServerHandle) -> Option<File> {
 }
 
 fn main() {
+  // Initialize file logging early so PCI-scan-phase diagnostics are captured.
+  hda::filelog::init();
   println!("Attempt to create PCI channels: ");
   let (mut pci_from_write, pci_from_read) = bounded(1024);
   println!("OK");
@@ -112,7 +115,29 @@ fn main() {
 }
 
 fn hda_main(pci_to_write: Sender<Vec<u8>>, pci_from_read: Receiver<Vec<u8>>, pci_from_write: Sender<Vec<u8>>, pci_to_read: Receiver<Vec<u8>>, drivers: Vec<(DriverHandler, SubdriverArguments)>) {
-  std::println!("Opening Intel HDA"); 
+  std::println!("Opening Intel HDA");
+
+  // Print all found HDA controllers for diagnostics
+  println!("Found {} HDA controller(s):", drivers.len());
+  for (i, (_, args)) in drivers.iter().enumerate() {
+    println!("  [{}] {:04X}:{:04X} bus={:02X} dev={:02X} func={:02X} BAR0={}",
+      i, args.func.venid, args.func.devid,
+      args.func.bus_num, args.func.dev_num, args.func.func_num,
+      args.func.bars[0]);
+  }
+
+  // Sort: prefer chipset HDA controllers (vendor 0x1022, 0x8086, etc.)
+  // over GPU HDMI/DP audio controllers (vendor 0x1002 = AMD/ATI GPU).
+  // GPU HDMI audio codecs won't respond unless a display link is active.
+  let mut drivers = drivers;
+  drivers.sort_by_key(|(_, args)| match args.func.venid {
+    0x1002 => 1u8, // AMD/ATI GPU HDMI audio — deprioritize
+    _ => 0u8,      // Chipset HDA controllers — prefer
+  });
+
+  println!("Selected controller: {:04X}:{:04X}",
+    drivers[0].1.func.venid, drivers[0].1.func.devid);
+
   let mut pcid_handle = PcidServerHandle::connect(pci_to_write, pci_to_read, pci_from_write, pci_from_read, drivers).expect("ihdad: failed to setup channel to pcid");
   std::println!("Setup PCID Handle"); 
 
@@ -162,9 +187,176 @@ let address = unsafe {
 	let vend_prod:u32 = ((pci_config.func.venid as u32) << 16) | (pci_config.func.devid as u32);
   println!("Makde vendor prod");
 
+  // Locate the firmware's EFI_PCI_IO_PROTOCOL for this controller so DMA
+  // buffers can be allocated/mapped through the IOMMU (pre-boot DMA works).
+  let dma_ok = efidma::init(
+    pci_config.func.bus_num as usize,
+    pci_config.func.dev_num as usize,
+    pci_config.func.func_num as usize,
+  );
+  println!("PciIo DMA mapping available: {}", dma_ok);
+
 	let mut device = unsafe { hda::IntelHDA::new(address, vend_prod).expect("ihdad: failed to allocate device") };
-  println!("Created intel hDA device; now what?");
-  // TODO: Now what?
+  println!("Created intel HDA device; starting pin enumeration test...");
+
+  enumerate_and_test_outputs(&mut device);
+
+  println!("Output pin enumeration complete.");
+}
+
+/// Enumerate all output pins and play a short tone on each one.
+/// This allows the user to identify which pin produces audible output
+/// by correlating the on-screen pin index with what they hear.
+fn enumerate_and_test_outputs(device: &mut hda::IntelHDA) {
+    let pin_count = device.output_pin_count();
+
+    println!("==============================================");
+    println!("  OUTPUT PIN ENUMERATION TEST");
+    println!("  {} output pin(s) found", pin_count);
+    println!("==============================================");
+
+    // Print all pins first
+    for i in 0..pin_count {
+        println!("  [{}] {}", i, device.output_pin_info_str(i));
+    }
+    println!("----------------------------------------------");
+
+    if pin_count == 0 {
+        println!("ERROR: No output pins found! Cannot test.");
+        return;
+    }
+
+    // Set up the output stream hardware (once)
+    device.setup_output_stream();
+
+    // ---- STATIC-TONE DIAGNOSTIC ----
+    // Pre-fill the whole cyclic buffer with a seamless looping sine and let the
+    // DMA loop it. This removes the producer/consumer streaming variable so we
+    // can determine whether the DAC produces a clean continuous tone at all.
+    // Target the INTERNAL SPEAKER (the device the blind user needs for TTS).
+    let mut speaker_idx = 0usize;
+    let mut found_speaker = false;
+    for i in 0..pin_count {
+        if device.output_pin_info_str(i).contains("Speaker") {
+            speaker_idx = i;
+            found_speaker = true;
+            break;
+        }
+    }
+    let speaker = device.output_pin_addr(speaker_idx);
+    println!("");
+    println!("==============================================");
+    println!("  STATIC TONE TEST (speaker found={})", found_speaker);
+    println!("  Speaker pin: {}", device.output_pin_info_str(speaker_idx));
+    println!("==============================================");
+
+    match device.configure_pin_for_output(speaker) {
+        Some(dac) => {
+            println!("  speaker configured via DAC {:02X}:{:02X}", dac.0, dac.1);
+            device.fill_static_tone(440.0);
+            println!("  PLAYING static ~440Hz tone (~4 s, looping buffer)...");
+            device.play_for_wraps(12);
+            println!("  static tone done.");
+
+            // Validate the STREAMING path (what a TTS engine needs): feed an
+            // 880 Hz tone block-by-block through write_to_output. If audible as
+            // a distinct higher tone, real-time streaming works.
+            println!("  STREAMING an 880Hz tone (~3 s) via write_to_output...");
+            play_short_tone(device, 3.0, 880.0);
+            println!("  streamed tone done.");
+
+            // Stop the stream so the controller doesn't play freed memory
+            // (garbage noise) after we return to the UEFI shell.
+            device.stop_all_output();
+        }
+        None => {
+            println!("  ERROR: no path to DAC from speaker pin {:02X}:{:02X}", speaker.0, speaker.1);
+        }
+    }
+
+    println!("");
+    println!("==============================================");
+    println!("  STATIC TONE TEST COMPLETE");
+    println!("==============================================");
+}
+
+/// Play a sine wave tone for a given duration and frequency.
+/// Format: 48000 Hz, 16-bit signed PCM, stereo (mandatory HDA format per spec).
+fn play_short_tone(device: &mut hda::IntelHDA, duration_secs: f64, freq: f64) {
+    const SAMPLE_RATE: f64 = 48000.0;
+    const AMPLITUDE: f64 = 16384.0;    // ~50% volume
+    const CHANNELS: usize = 2;
+    const BYTES_PER_SAMPLE: usize = 2;  // 16-bit
+    const FRAME_SIZE: usize = CHANNELS * BYTES_PER_SAMPLE; // 4 bytes
+    const BLOCK_SIZE: usize = 2048;     // must match SUB_BUFF_SIZE
+    const FRAMES_PER_BLOCK: usize = BLOCK_SIZE / FRAME_SIZE; // 512
+
+    let total_frames = (SAMPLE_RATE * duration_secs) as usize;
+    let total_blocks = (total_frames + FRAMES_PER_BLOCK - 1) / FRAMES_PER_BLOCK;
+
+    let mut buf = [0u8; BLOCK_SIZE];
+    let mut sample_offset: usize = 0;
+
+    for block in 0..total_blocks {
+        // Fill the block with sine wave samples
+        for frame in 0..FRAMES_PER_BLOCK {
+            let t = (sample_offset + frame) as f64 / SAMPLE_RATE;
+            let value = libm::sin(2.0 * core::f64::consts::PI * freq * t) * AMPLITUDE;
+            let sample = value as i16;
+            let bytes = sample.to_le_bytes();
+
+            let byte_offset = frame * FRAME_SIZE;
+            // Left channel
+            buf[byte_offset] = bytes[0];
+            buf[byte_offset + 1] = bytes[1];
+            // Right channel (same as left)
+            buf[byte_offset + 2] = bytes[0];
+            buf[byte_offset + 3] = bytes[1];
+        }
+        sample_offset += FRAMES_PER_BLOCK;
+
+        // Write block, retrying if the buffer is full
+        let mut retries = 0u32;
+        loop {
+            match device.write_to_output(0, &buf) {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    retries += 1;
+                    if retries > 50000 {
+                        println!("  DMA stalled at block {}/{}, aborting tone", block, total_blocks);
+                        return;
+                    }
+                    hda::delay_us(500);
+                }
+                Err(e) => {
+                    println!("  Audio write error: {:?}", e);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Write a block of silence to flush out the last tone samples
+    let silence = [0u8; BLOCK_SIZE];
+    for _ in 0..4 {
+        let mut retries = 0u32;
+        loop {
+            match device.write_to_output(0, &silence) {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    retries += 1;
+                    if retries > 10000 {
+                        break;
+                    }
+                    hda::delay_us(500);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    // Wait for remaining buffered audio to play out
+    hda::delay_us(400_000);
 }
 
 ////#![deny(warnings)]
@@ -314,19 +506,17 @@ let address = unsafe {
 //	// Daemonize
 //    redox_daemon::Daemon::new(daemon).expect("ihdad: failed to daemonize");
 //}
-use std::fs::{File};
-use std::io::prelude::*;
+use std::fs::File;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::{i64};
+use std::i64;
 
 use log::{trace, warn};
 
 use pcid::config::Config;
 
-
 use pcid::pci::{
-    CfgAccess, Pci, PciBar, PciBus, PciClass, PciDev, PciFunc, PciHeader, PciHeaderError,
+    Pci, PciBar, PciBus, PciClass, PciDev, PciFunc, PciHeader, PciHeaderError,
     PciHeaderType,
 };
 use pcid::pcie::Pcie;
@@ -490,6 +680,81 @@ fn handle_parsed_header(
                 data |= 7;
                 pci.write(bus_num, dev_num, func_num, 0x04, data);
             }
+
+            // Vendor-specific PCIe snoop / traffic class configuration.
+            // Without this, DMA is not cache-coherent on some controllers.
+            let vendor_id = header.vendor_id();
+            unsafe {
+                match vendor_id {
+                    // Intel: Set Traffic Class Select (TCSEL) register
+                    // PCI config offset 0x44, clear bits [2:0] to select TC0
+                    0x8086 => {
+                        let tcsel = pci.read(bus_num, dev_num, func_num, 0x44);
+                        pci.write(bus_num, dev_num, func_num, 0x44, tcsel & 0xFFFF_FFF8);
+                        println!("HDA: Intel TCSEL configured (was {:#X})", tcsel & 0x7);
+                    }
+                    // AMD: Enable PCIe snoop at PCI config register 0x42
+                    // Read byte at 0x42, mask with 0xF8, OR with 0x02 to enable snoop
+                    // 0x1022 = AMD chipset HDA, 0x1002 = AMD/ATI GPU HDMI audio
+                    0x1022 | 0x1002 => {
+                        let reg40 = pci.read(bus_num, dev_num, func_num, 0x40);
+                        let byte42 = ((reg40 >> 16) & 0xFF) as u32;
+                        let new_byte42 = (byte42 & 0xF8) | 0x02;
+                        let new_reg40 = (reg40 & 0xFF00FFFF) | (new_byte42 << 16);
+                        pci.write(bus_num, dev_num, func_num, 0x40, new_reg40);
+                        println!("HDA: AMD PCIe snoop enabled (reg42: {:#X} -> {:#X})", byte42, new_byte42);
+                    }
+                    // Nvidia: reg 0x4E, mask 0xF0, enable 0x0F
+                    0x10DE => {
+                        let reg4c = pci.read(bus_num, dev_num, func_num, 0x4C);
+                        let byte4e = ((reg4c >> 16) & 0xFF) as u32;
+                        let new_byte4e = (byte4e & 0xF0) | 0x0F;
+                        let new_reg4c = (reg4c & 0xFF00FFFF) | (new_byte4e << 16);
+                        pci.write(bus_num, dev_num, func_num, 0x4C, new_reg4c);
+                        println!("HDA: Nvidia snoop enabled (reg4E: {:#X} -> {:#X})", byte4e, new_byte4e);
+                    }
+                    _ => {
+                        println!("HDA: Unknown vendor {:#06X}, no snoop config applied", vendor_id);
+                    }
+                }
+            }
+
+            // Verify bus master enable stuck, and force cache-coherent DMA by
+            // clearing the PCIe "No Snoop Enable" bit (DevCtl bit 11). With
+            // NoSnoop disabled the controller's DMA must be snooped, so device
+            // DMA stays coherent with CPU caches without relying on clflush.
+            unsafe {
+                let cmd = pci.read(bus_num, dev_num, func_num, 0x04);
+                crate::flog!("PCI {:02X}:{:02X}.{:X} vend={:#06X} dev={:#06X} cmd={:#06X} BusMaster={}",
+                    bus_num, dev_num, func_num, header.vendor_id(), header.device_id(),
+                    cmd & 0xFFFF, (cmd >> 2) & 1);
+
+                let status = (pci.read(bus_num, dev_num, func_num, 0x04) >> 16) as u16;
+                if status & (1 << 4) != 0 {
+                    let mut cap_ptr = (pci.read(bus_num, dev_num, func_num, 0x34) & 0xFC) as u8;
+                    let mut guard = 0;
+                    while cap_ptr >= 0x40 && guard < 48 {
+                        let capw = pci.read(bus_num, dev_num, func_num, cap_ptr as u16);
+                        let cap_id = (capw & 0xFF) as u8;
+                        let next = ((capw >> 8) & 0xFF) as u8;
+                        if cap_id == 0x10 {
+                            // PCI Express capability: DevCtl is 16 bits at cap+0x08.
+                            let devctl_off = cap_ptr as u16 + 0x08;
+                            let dc = pci.read(bus_num, dev_num, func_num, devctl_off);
+                            let devctl = (dc & 0xFFFF) as u16;
+                            let new_devctl = devctl & !(1 << 11); // clear No Snoop Enable
+                            pci.write(bus_num, dev_num, func_num, devctl_off,
+                                (dc & 0xFFFF_0000) | new_devctl as u32);
+                            let rb = (pci.read(bus_num, dev_num, func_num, devctl_off) & 0xFFFF) as u16;
+                            crate::flog!("  PCIe cap@{:#X} DevCtl {:#06X} -> {:#06X} readback {:#06X} (cleared NoSnoop)",
+                                cap_ptr, devctl, new_devctl, rb);
+                        }
+                        cap_ptr = next;
+                        guard += 1;
+                    }
+                }
+            }
+            crate::hda::filelog::flush();
 
             // Set IRQ line to 9 if not set
             let mut irq;
@@ -761,5 +1026,53 @@ fn pci_main(
             }
         }
     }
+
+  // --- AMD-Vi IOMMU probe (read-only) ---
+  // Bus master is on, NoSnoop cleared, addresses are identity-mapped, yet the
+  // controller's DMA never reaches CPU memory. The remaining intercept is the
+  // IOMMU (PCI 00:00.2). Read its control register to confirm the firmware
+  // left it enabled in pre-boot.
+  unsafe {
+    let id0 = pci.read(0, 0, 2, 0x00);
+    let vend = (id0 & 0xFFFF) as u16;
+    let devid = ((id0 >> 16) & 0xFFFF) as u16;
+    crate::flog!("IOMMU probe 00:00.2 vendor={:#06X} device={:#06X}", vend, devid);
+    if vend == 0x1022 {
+      let mut cap = (pci.read(0, 0, 2, 0x34) & 0xFC) as u8;
+      let mut guard = 0;
+      while cap >= 0x40 && guard < 48 {
+        let capw = pci.read(0, 0, 2, cap as u16);
+        let id = (capw & 0xFF) as u8;
+        let next = ((capw >> 8) & 0xFF) as u8;
+        crate::flog!("  cap@{:#04X} id={:#04X}", cap, id);
+        if id == 0x0F {
+          // AMD IOMMU capability: MMIO base in cap+0x04 (low, bit0=enable) / cap+0x08 (high)
+          let base_lo = pci.read(0, 0, 2, cap as u16 + 0x04);
+          let base_hi = pci.read(0, 0, 2, cap as u16 + 0x08);
+          let en = base_lo & 1;
+          let mmio = ((base_hi as u64) << 32) | ((base_lo & 0xFFFF_C000) as u64);
+          crate::flog!("  IOMMU cap base_lo={:#010X} base_hi={:#010X} mmio={:#X} mmio_en={}",
+            base_lo, base_hi, mmio, en);
+          crate::hda::filelog::flush();
+          if en == 1 && mmio >= 0x1000 {
+            // IOMMU MMIO: Device Table Base @ +0x00, Control Register @ +0x18 (64-bit)
+            let devtab = core::ptr::read_volatile((mmio + 0x00) as *const u64);
+            let ctrl = core::ptr::read_volatile((mmio + 0x18) as *const u64);
+            crate::flog!("  IOMMU DevTabBase={:#018X} Control={:#018X} IommuEn={}",
+              devtab, ctrl, ctrl & 1);
+            // NOTE: do NOT clear IommuEn here — writing the control register
+            // HANGS this firmware. We cooperate with the IOMMU via
+            // EFI_PCI_IO_PROTOCOL.Map() instead (see efidma module).
+          } else {
+            crate::flog!("  IOMMU MMIO not enabled or base invalid; not touching control reg");
+          }
+        }
+        cap = next;
+        guard += 1;
+      }
+    }
+  }
+  crate::hda::filelog::flush();
+
   handlers
 }

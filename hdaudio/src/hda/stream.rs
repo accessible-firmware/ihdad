@@ -110,14 +110,33 @@ impl StreamDescriptorRegs {
 	}
 
 	pub fn control(&self) -> u32 {
-		let mut ctrl = self.ctrl_lo.read() as u32;
-		ctrl |= (self.ctrl_hi.read() as u32) << 16;
-		ctrl
+		// AMD controllers require 32-bit DWORD access to SD_CTL.
+		// Reading as two separate 16-bit + 8-bit accesses can miss updates
+		// on some AMD hardware. Read full DWORD, mask off SD_STS (byte 3).
+		unsafe {
+			let val = core::ptr::read_volatile(
+				&self.ctrl_lo as *const Mmio<u16> as *const u32
+			);
+			val & 0x00FF_FFFF // mask off status byte (bits 31:24)
+		}
 	}
 
 	pub fn set_control(&mut self, control:u32) {
-		self.ctrl_lo.write((control & 0xFFFF) as u16);
-		self.ctrl_hi.write(((control >> 16) & 0xFF) as u8);
+		// AMD controllers require 32-bit DWORD access to SD_CTL.
+		// Writing as split 16-bit + 8-bit can cause the stream tag
+		// (bits 23:20) to not take effect, so the DAC never receives data.
+		// Write full DWORD with status byte zeroed (writing 0 to W1C bits
+		// in SD_STS is a no-op, so this is safe).
+		unsafe {
+			core::ptr::write_volatile(
+				&mut self.ctrl_lo as *mut Mmio<u16> as *mut u32,
+				control & 0x00FF_FFFF // zero out status byte
+			);
+		}
+	}
+
+	pub fn pcm_format(&self) -> u16 {
+		self.format.read()
 	}
 
 	pub fn set_pcm_format(&mut self, sr: &SampleRate, bps: BitsPerSample, channels:u8) {
@@ -140,6 +159,37 @@ impl StreamDescriptorRegs {
 
 	pub fn cyclic_buffer_length(&self) -> u32 {
 		self.buff_length.read()
+	}
+
+	/// Reset stream descriptor per HDA spec section 3.3.35.
+	/// Must be called before configuring a stream to ensure it's in a
+	/// known state. Firmware may have left streams partially configured.
+	pub fn reset(&mut self) {
+		// 1. Set SRST bit (bit 0 of control register)
+		let ctrl = self.control();
+		self.set_control((ctrl & !0x2) | 0x1); // Set SRST, clear RUN
+
+		// 2. Poll until SRST reads back as 1 (acknowledged)
+		// Timeout after 10ms (1000 iterations * 10us)
+		for _ in 0..1000 {
+			if self.control() & 0x1 != 0 {
+				break;
+			}
+			super::delay_us(10);
+		}
+
+		// 3. Clear SRST bit
+		let ctrl = self.control();
+		self.set_control(ctrl & !0x1);
+
+		// 4. Poll until SRST reads back as 0 (reset complete)
+		// Timeout after 10ms (1000 iterations * 10us)
+		for _ in 0..1000 {
+			if self.control() & 0x1 == 0 {
+				break;
+			}
+			super::delay_us(10);
+		}
 	}
 
 	pub fn run(&mut self) {
@@ -299,18 +349,31 @@ pub struct StreamBuffer {
 
 impl StreamBuffer {
 	pub fn new(block_length: usize, block_count: usize) -> result::Result<StreamBuffer, &'static str> {
-    let size = block_length + block_count;
-    let layout = Layout::from_size_align(size, 4096).unwrap();
-    let ptr: *mut u8 = unsafe { alloc(layout) }; 
+		// BUG FIX: was block_length + block_count, should be multiplication
+		let size = block_length * block_count;
+		let pages = (size + 4095) / 4096;
 
-    // TODO: Already zeroed by kernel?
+		// Prefer IOMMU-mapped DMA memory via EFI_PCI_IO_PROTOCOL so the
+		// controller can actually reach it. addr = host (CPU), phys = device (DMA).
+		if let Some((host, device)) = crate::efidma::alloc_common(pages) {
+			return Ok(StreamBuffer {
+				addr: host,
+				phys: device,
+				block_len: block_length,
+				block_cnt: block_count,
+				cur_pos: 0,
+			});
+		}
+
+		// Fallback (e.g. QEMU without IOMMU): plain allocation, addr == phys.
+		let layout = Layout::from_size_align(size, 4096).unwrap();
+		let ptr: *mut u8 = unsafe { alloc(layout) };
 		unsafe {
 			ptr::write_bytes(ptr, 0, block_length * block_count);
 		}
-
 		Ok(StreamBuffer {
 			addr:   ptr as usize,
-      phys: ptr as usize,
+			phys: ptr as usize,
 			block_len: block_length,
 			block_cnt:  block_count,
 			cur_pos: 0,
@@ -321,10 +384,12 @@ impl StreamBuffer {
 		self.block_len * self.block_cnt
 	}
 
+	/// Host (CPU) virtual address — for writing sample data.
 	pub fn addr(&self) -> usize {
-		self.phys
+		self.addr
 	}
 
+	/// Device (DMA) address — for programming into BDL entries / the controller.
 	pub fn phys(&self) -> usize {
 		self.phys
 	}
@@ -349,9 +414,14 @@ impl StreamBuffer {
 
 
 		//log::trace!("Phys: {:X} Virt: {:X} Offset: {:X} Len: {:X}", self.phys(), self.addr(), self.current_block() * self.block_size(), len);
+		let dst_addr = self.addr() + self.current_block() * self.block_size();
 		unsafe {
-			copy_nonoverlapping(buf.as_ptr(), (self.addr() + self.current_block() * self.block_size()) as * mut u8, len);
+			copy_nonoverlapping(buf.as_ptr(), dst_addr as *mut u8, len);
 		}
+
+		// Flush written audio data from CPU cache to memory so the DMA engine
+		// reads actual audio samples instead of stale zeros.
+		super::cache_flush_region(dst_addr, len);
 
 		self.cur_pos += 1;
 		self.cur_pos %= self.block_count();
@@ -362,14 +432,10 @@ impl StreamBuffer {
 }
 impl Drop for StreamBuffer {
 	fn drop(&mut self) {
-		unsafe {
-			log::debug!("IHDA: Deallocating buffer.");
-      let _page_aligned_size = (self.block_len * self.block_cnt).next_multiple_of(4096);
-
-      let layout = Layout::from_size_align(self.block_len * self.block_cnt, 4096).unwrap();
-      unsafe {
-        dealloc(self.addr as *mut u8, layout);
-      }
-		}
+		// Intentionally leak. The buffer may be EFI_PCI_IO_PROTOCOL DMA memory
+		// (not from the Rust global allocator), so calling dealloc() here would
+		// be undefined behavior. This is a short-lived pre-boot program, so the
+		// firmware reclaims everything on exit.
+		log::debug!("IHDA: StreamBuffer drop (leaked; DMA memory).");
 	}
 }

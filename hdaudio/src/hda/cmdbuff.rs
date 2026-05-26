@@ -1,6 +1,7 @@
 //use syscall::io::{Io, Mmio};
 
 use crate::hda::io::{Io, Mmio};
+use crate::flog;
 use super::common::*;
 
 // CORBCTL
@@ -86,14 +87,16 @@ impl Corb {
     }
     //Intel 4.4.1.3
     pub fn init(&mut self) {
-        println!("{}:{}", file!(), line!());
+        flog!("CORB::init() starting");
         self.stop();
-        println!("{}:{}", file!(), line!());
+        flog!("  CORB stopped (CORBCTL={:#04X})", self.regs.corbctl.read());
+
         //Determine CORB and RIRB size and allocate buffer
 
         //3.3.24
         let corbsize_reg = self.regs.corbsize.read();
         let corbszcap = (corbsize_reg >> 4) & 0xF;
+        flog!("  CORBSIZE reg={:#04X} szcap={:#X}", corbsize_reg, corbszcap);
 
         let mut corbsize_bytes: usize = 0;
         let mut corbsize: u8 = 0;
@@ -116,20 +119,44 @@ impl Corb {
         }
 
         assert!(self.corb_count != 0);
+        flog!("  chosen: corbsize={} ({} bytes, {} entries)", corbsize, corbsize_bytes, self.corb_count);
+
+        // Program the selected CORB size into hardware
+        self.regs.corbsize.write(corbsize);
+        flog!("  CORBSIZE after write={:#04X}", self.regs.corbsize.read());
+
         let addr = self.corb_base_phys;
+        flog!("  CORB buffer phys={:#010X} virt={:p}", addr, self.corb_base);
         self.set_address(addr);
+        flog!("  CORBLBASE={:#010X} CORBUBASE={:#010X}",
+            self.regs.corblbase.read(), self.regs.corbubase.read());
         self.regs.corbwp.write(0);
         self.reset_read_pointer();
+        flog!("  after init: CORBWP={:#06X} CORBRP={:#06X} CORBCTL={:#04X}",
+            self.regs.corbwp.read(), self.regs.corbrp.read(), self.regs.corbctl.read());
     }
 
     pub fn start(&mut self) {
+        flog!("CORB::start() CORBCTL before={:#04X}", self.regs.corbctl.read());
         self.regs.corbctl.writef(CORBRUN, true);
+        // Verify CORB DMA is running
+        super::delay_us(100);
+        let ctl = self.regs.corbctl.read();
+        flog!("  CORBCTL after={:#04X} (CORBRUN={})", ctl, (ctl >> 1) & 1);
+        if ctl & CORBRUN == 0 {
+            flog!("  WARNING: CORB DMA did not start!");
+        }
     }
 
     #[inline(never)]
     pub fn stop(&mut self) {
-        while self.regs.corbctl.readf(CORBRUN) {
+        // Stop CORB DMA with timeout
+        for _ in 0..10000 {
+            if !self.regs.corbctl.readf(CORBRUN) {
+                break;
+            }
             self.regs.corbctl.write(0);
+            super::delay_us(10);
         }
     }
 
@@ -139,51 +166,64 @@ impl Corb {
     }
 
     pub fn reset_read_pointer(&mut self) {
-        /*
-         * FIRST ISSUE/PATCH
-         * This will loop forever in virtualbox
-         * So maybe just resetting the read pointer
-         * and leaving for the specific model?
-         */
-        if true {
-            self.regs.corbrp.writef(CORBRPRST, true);
-        } else {
-            // 3.3.21
-
-            self.stop();
-            // Set CORBRPRST to 1
-            println!("CORBRP {:X}", self.regs.corbrp.read());
-            self.regs.corbrp.writef(CORBRPRST, true);
-            println!("CORBRP {:X}", self.regs.corbrp.read());
-
-            // Wait for it to become 1
-            while !self.regs.corbrp.readf(CORBRPRST) {
-                self.regs.corbrp.writef(CORBRPRST, true);
-            }
-            // Clear the bit again
-            self.regs.corbrp.write(0);
-
-            // Read back the bit until zero to verify that it is cleared.
-
-            loop {
-                if !self.regs.corbrp.readf(CORBRPRST) {
-                    break;
-                }
-                self.regs.corbrp.write(0);
-            }
-        }
+        // FreeBSD approach: write the reset bit, then immediately write 0
+        // to clear it. The HDA spec says CORBRPRST always reads as 0, but
+        // some hardware (e.g., 82801G) is buggy and doesn't clear the bit,
+        // which stalls the CORB engine. Don't bother polling.
+        self.regs.corbrp.write(CORBRPRST);
+        super::delay_us(100);
+        self.regs.corbrp.write(0);
     }
 
     fn send_command(&mut self, cmd: u32) {
+        // Decode: codec=(cmd>>28)&0xF, nid=(cmd>>20)&0xFF, verb+data=cmd&0xFFFFF
+        let codec = (cmd >> 28) & 0xF;
+        let nid = (cmd >> 20) & 0xFF;
+        let verb_data = cmd & 0xFFFFF;
+        flog!("CORB TX: {:#010X} (codec={} nid={:#04X} verb+data={:#07X})", cmd, codec, nid, verb_data);
+
+        let pre_wp = self.regs.corbwp.read();
+        let pre_rp = self.regs.corbrp.read();
+        flog!("  CORB pre: WP={:#06X} RP={:#06X} CTL={:#04X}", pre_wp, pre_rp, self.regs.corbctl.read());
+
         // wait for the commands to finish
-        while (self.regs.corbwp.read() & 0xff) != (self.regs.corbrp.read() & 0xff) {}
-        let write_pos: usize =
-            ((self.regs.corbwp.read() as usize & 0xFF) + 1) % self.corb_count;
-        unsafe {
-            *self.corb_base.offset(write_pos as isize) = cmd;
+        // Timeout after 10000 iterations (~100ms) to prevent infinite hang
+        let mut drain_iters = 0u32;
+        for i in 0..10000u32 {
+            if (self.regs.corbwp.read() & 0xff) == (self.regs.corbrp.read() & 0xff) {
+                drain_iters = i;
+                break;
+            }
+            super::delay_us(10);
+            if i == 9999 {
+                drain_iters = i;
+                flog!("CORB: TIMEOUT waiting for commands to finish (wp={:#X} rp={:#X})",
+                    self.regs.corbwp.read(), self.regs.corbrp.read());
+                println!("CORB: timeout waiting for commands to finish");
+            }
+        }
+        if drain_iters > 0 {
+            flog!("  CORB drain waited {} iters (WP={:#06X} RP={:#06X})",
+                drain_iters, self.regs.corbwp.read(), self.regs.corbrp.read());
         }
 
+        let write_pos: usize =
+            ((self.regs.corbwp.read() as usize & 0xFF) + 1) % self.corb_count;
+        flog!("  CORB writing cmd {:#010X} to entry[{}] (base={:p})", cmd, write_pos, self.corb_base);
+        unsafe {
+            core::ptr::write_volatile(self.corb_base.offset(write_pos as isize), cmd);
+        }
+
+        // Read back the written value to verify the write
+        let readback = unsafe { core::ptr::read_volatile(self.corb_base.offset(write_pos as isize)) };
+        flog!("  CORB readback entry[{}]={:#010X} (match={})", write_pos, readback, readback == cmd);
+
+        // Flush CORB entry from CPU cache to memory so the DMA engine sees it
+        let entry_addr = self.corb_base as usize + write_pos * core::mem::size_of::<u32>();
+        super::cache_flush_region(entry_addr, core::mem::size_of::<u32>());
+
         self.regs.corbwp.write(write_pos as u16);
+        flog!("  CORB post: WP={:#06X} RP={:#06X}", self.regs.corbwp.read(), self.regs.corbrp.read());
 
         println!("Corb: {:08X}", cmd);
     }
@@ -222,10 +262,13 @@ impl Rirb {
     }
     //Intel 4.4.1.3
     pub fn init(&mut self) {
+        flog!("RIRB::init() starting");
         self.stop();
+        flog!("  RIRB stopped (RIRBCTL={:#04X})", self.regs.rirbctl.read());
 
         let rirbsize_reg = self.regs.rirbsize.read();
         let rirbszcap = (rirbsize_reg >> 4) & 0xF;
+        flog!("  RIRBSIZE reg={:#04X} szcap={:#X}", rirbsize_reg, rirbszcap);
 
         let mut rirbsize_bytes: usize = 0;
         let mut rirbsize: u8 = 0;
@@ -248,18 +291,43 @@ impl Rirb {
         }
 
         assert!(self.rirb_count != 0);
+        flog!("  chosen: rirbsize={} ({} bytes, {} entries)", rirbsize, rirbsize_bytes, self.rirb_count);
+
+        // Program the selected RIRB size into hardware
+        self.regs.rirbsize.write(rirbsize);
+        flog!("  RIRBSIZE after write={:#04X}", self.regs.rirbsize.read());
 
         let addr = self.rirb_base_phys;
+        flog!("  RIRB buffer phys={:#010X} virt={:p}", addr, self.rirb_base);
         self.set_address(addr);
+        flog!("  RIRBLBASE={:#010X} RIRBUBASE={:#010X}",
+            self.regs.rirblbase.read(), self.regs.rirbubase.read());
 
         self.reset_write_pointer();
         self.rirb_rp = 0;
 
         self.regs.rintcnt.write(1);
+        flog!("  after init: RIRBWP={:#06X} rirb_rp={} RIRBCTL={:#04X} RINTCNT={}",
+            self.regs.rirbwp.read(), self.rirb_rp, self.regs.rirbctl.read(), self.regs.rintcnt.read());
+
+        // Dump first few RIRB entries to verify buffer is zeroed
+        for i in 0..4u16 {
+            let val = unsafe { core::ptr::read_volatile(self.rirb_base.offset(i as isize)) };
+            flog!("  RIRB[{}] = {:#018X}", i, val);
+        }
     }
 
     pub fn start(&mut self) {
+        flog!("RIRB::start() RIRBCTL before={:#04X}", self.regs.rirbctl.read());
         self.regs.rirbctl.writef(RIRBDMAEN | RINTCTL, true);
+        // Verify RIRB DMA is running
+        super::delay_us(100);
+        let ctl = self.regs.rirbctl.read();
+        flog!("  RIRBCTL after={:#04X} (DMAEN={}, RINTCTL={})", ctl, (ctl >> 1) & 1, ctl & 1);
+        if ctl & RIRBDMAEN == 0 {
+            flog!("  WARNING: RIRB DMA did not start!");
+        }
+        flog!("  RIRBWP={:#06X} at start time", self.regs.rirbwp.read());
     }
 
     pub fn stop(&mut self) {
@@ -278,15 +346,62 @@ impl Rirb {
     }
 
     fn read_response(&mut self) -> u64 {
+        let entry_rirbwp = self.regs.rirbwp.read();
+        flog!("RIRB read_response(): entry RIRBWP={:#06X} rirb_rp={} rirb_count={}",
+            entry_rirbwp, self.rirb_rp, self.rirb_count);
+
         // wait for response
-        while (self.regs.rirbwp.read() & 0xff) == (self.rirb_rp & 0xff) {}
+        // Timeout after 10000 iterations (~100ms) to prevent infinite hang
+        let mut poll_iters = 0u32;
+        let mut timed_out = false;
+        for i in 0..10000u32 {
+            if (self.regs.rirbwp.read() & 0xff) != (self.rirb_rp & 0xff) {
+                poll_iters = i;
+                break;
+            }
+            super::delay_us(10);
+            if i == 9999 {
+                poll_iters = i;
+                timed_out = true;
+                flog!("RIRB: TIMEOUT waiting for response (wp={:#X} rp={:#X})",
+                    self.regs.rirbwp.read(), self.rirb_rp);
+                println!("RIRB: timeout waiting for response");
+            }
+        }
+        let exit_rirbwp = self.regs.rirbwp.read();
+        flog!("  RIRB poll done: {} iters, timed_out={}, RIRBWP now={:#06X}",
+            poll_iters, timed_out, exit_rirbwp);
+
         let read_pos: u16 = (self.rirb_rp + 1) % self.rirb_count as u16;
+        flog!("  reading RIRB[{}] (base={:p}, byte_offset={})", read_pos, self.rirb_base, (read_pos as usize) * 8);
+
+        // Flush RIRB entry from CPU cache so we read DMA-written data from memory
+        let entry_addr = self.rirb_base as usize + (read_pos as usize) * core::mem::size_of::<u64>();
+        super::cache_flush_region(entry_addr, core::mem::size_of::<u64>());
 
         let res: u64;
         unsafe {
-            res = *self.rirb_base.offset(read_pos as isize);
+            res = core::ptr::read_volatile(self.rirb_base.offset(read_pos as isize));
         }
+
+        // Also dump a few surrounding entries for context
+        flog!("  RIRB buffer dump around read_pos={}:", read_pos);
+        for i in 0..core::cmp::min(4u16, self.rirb_count as u16) {
+            let val = unsafe { core::ptr::read_volatile(self.rirb_base.offset(i as isize)) };
+            let marker = if i == read_pos { " <-- READ" } else { "" };
+            flog!("    RIRB[{}] = {:#018X}{}", i, val, marker);
+        }
+
         self.rirb_rp = read_pos;
+        // Low 32 bits = response, high 32 bits = response extended (solicited/unsolicited + codec addr)
+        flog!("RIRB RX: {:#018X} (resp={:#010X} ext={:#010X})", res, res & 0xFFFFFFFF, (res >> 32) & 0xFFFFFFFF);
+
+        // Check for suspicious all-zeros response
+        if res == 0 {
+            flog!("  WARNING: RIRB response is all zeros! RIRBSTS={:#04X} RIRBCTL={:#04X}",
+                self.regs.rirbsts.read(), self.regs.rirbctl.read());
+        }
+
         println!("Rirb: {:08X}", res);
         res
     }
@@ -313,8 +428,18 @@ impl ImmediateCommand {
     }
 
     pub fn cmd(&mut self, cmd: u32) -> u64 {
+        flog!("ICS TX: {:#010X}", cmd);
         // wait for ready
-        while self.regs.ics.readf(ICB) {}
+        for i in 0..10000u32 {
+            if !self.regs.ics.readf(ICB) {
+                break;
+            }
+            super::delay_us(10);
+            if i == 9999 {
+                flog!("ICS: TIMEOUT waiting for ready");
+                println!("ICS: timeout waiting for ready");
+            }
+        }
 
         // write command
         self.regs.icoi.write(cmd);
@@ -323,16 +448,26 @@ impl ImmediateCommand {
         self.regs.ics.writef(ICB, true);
 
         // wait for IRV bit to be set to indicate a response is latched
-        while !self.regs.ics.readf(IRV) {}
+        for i in 0..10000u32 {
+            if self.regs.ics.readf(IRV) {
+                break;
+            }
+            super::delay_us(10);
+            if i == 9999 {
+                flog!("ICS: TIMEOUT waiting for IRV");
+                println!("ICS: timeout waiting for IRV");
+            }
+        }
 
-        // read the result register twice, total of 8 bytes
-        // highest 4 will most likely be zeros (so I've heard)
-        let mut res: u64 = self.regs.irii.read() as u64;
-        res |= (self.regs.irii.read() as u64) << 32;
+        // Read the 32-bit Immediate Response register once and zero-extend.
+        // The old code read the register twice, duplicating the value in
+        // both halves (e.g. 0x10EC029510EC0295 instead of 0x10EC0295).
+        let res: u64 = self.regs.irii.read() as u64;
 
         // clear the bit so we know when the next response comes
         self.regs.ics.writef(IRV, false);
 
+        flog!("ICS RX: {:#018X}", res);
         res
     }
 }
@@ -377,9 +512,12 @@ impl CommandBuffer {
     }
 
     pub fn init(&mut self, use_imm_cmds: bool) {
+        flog!("CommandBuffer::init(use_imm_cmds={})", use_imm_cmds);
         self.corb.init();
         self.rirb.init();
+        flog!("CORB/RIRB init done, now starting DMA engines...");
         self.set_use_imm_cmds(use_imm_cmds);
+        flog!("CommandBuffer::init() complete");
     }
 
     pub fn cmd12(&mut self, addr: WidgetAddr, command: u32, data: u8) -> u64 {
@@ -419,14 +557,24 @@ impl CommandBuffer {
     }
 
     pub fn set_use_imm_cmds(&mut self, use_imm: bool) {
+        flog!("set_use_imm_cmds({})", use_imm);
         self.use_immediate_cmd = use_imm;
 
         if self.use_immediate_cmd {
+            flog!("  using Immediate Command Interface, stopping CORB/RIRB");
             self.corb.stop();
             self.rirb.stop();
         } else {
+            flog!("  using CORB/RIRB, starting DMA engines...");
             self.corb.start();
             self.rirb.start();
+            // Small delay after starting DMA engines before sending commands
+            super::delay_us(500);
+            flog!("  DMA engines started, post-delay CORBCTL={:#04X} RIRBCTL={:#04X}",
+                self.corb.regs.corbctl.read(), self.rirb.regs.rirbctl.read());
+            flog!("  CORBWP={:#06X} CORBRP={:#06X} RIRBWP={:#06X} rirb_rp={}",
+                self.corb.regs.corbwp.read(), self.corb.regs.corbrp.read(),
+                self.rirb.regs.rirbwp.read(), self.rirb.rirb_rp);
         }
     }
 }

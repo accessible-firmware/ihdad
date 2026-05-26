@@ -28,3 +28,5 @@ thiserror = "1"
 toml = "0.5"
 
 lazy_static = "1.4.0"
+libm = "0.2"
+r-efi = "5"

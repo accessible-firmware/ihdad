@@ -1,8 +1,6 @@
 use core::cmp::PartialEq;
 use core::ops::{BitAnd, BitOr, Not};
 
-
-use core::ptr::{read_unaligned, write_unaligned};
 use core::mem::MaybeUninit;
 
 #[repr(packed)]
@@ -37,18 +35,15 @@ impl<T> Io for Mmio<T> where T: Copy + PartialEq + BitAnd<Output = T> + BitOr<Ou
     type Value = T;
 
     fn read(&self) -> T {
-        unsafe { 
-					self.value.assume_init()
-          //let ptr = self.value;
-         //read_unaligned(ptr.as_ptr())
+        unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(self.value) as *const T)
         }
     }
 
     fn write(&mut self, value: T) {
-				*self = Mmio::from(value);
-        //unsafe { 
-				//	write_unaligned(*mut self.value, value)
-        //}
+        unsafe {
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(self.value) as *mut T, value)
+        }
     }
 }
 
