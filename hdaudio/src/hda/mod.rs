@@ -10,18 +10,27 @@ pub mod filelog;
 pub use self::stream::*;
 pub use self::node::*;
 
-/// Busy-wait delay using TSC (Time Stamp Counter).
+/// Accurate microsecond delay using the UEFI firmware's BootServices.Stall().
 ///
-/// Assumes a minimum TSC frequency of 1 GHz (1000 cycles/us), which is
-/// conservative for any modern x86_64 CPU. The actual delay will be at
-/// least `us` microseconds.
+/// Previously this busy-waited on the TSC assuming a 1 GHz clock, but this CPU
+/// runs 3-4 GHz, so delays were 3-4x too short and the mandatory HDA reset /
+/// codec-discovery timings (spec: >=100 us, >=521 us) were not actually met.
+/// That made controller reset unreliable after warm reboots. Stall() delays an
+/// accurate number of microseconds. Falls back to a (short) TSC wait only if
+/// boot services are somehow unavailable.
 #[inline(never)]
 pub fn delay_us(us: u64) {
     unsafe {
+        let st = std::os::uefi::env::system_table().as_ptr() as *mut r_efi::efi::SystemTable;
+        if !st.is_null() {
+            let bs = (*st).boot_services;
+            if !bs.is_null() {
+                ((*bs).stall)(us as usize);
+                return;
+            }
+        }
+        // Fallback: TSC busy-wait (assumes >= 1 GHz; under-delays on fast CPUs).
         let start = core::arch::x86_64::_rdtsc();
-        // Conservative: assume at least 1 GHz TSC = 1000 cycles per us.
-        // Real hardware is typically 2-4 GHz, so delays will be at least
-        // as long as requested.
         let target_cycles = us.saturating_mul(1000);
         while core::arch::x86_64::_rdtsc().wrapping_sub(start) < target_cycles {
             core::hint::spin_loop();

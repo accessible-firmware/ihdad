@@ -289,6 +289,10 @@ impl OutputStream {
 		self.buff.current_block()
 	}
 
+	pub fn set_current_block(&mut self, b: usize) {
+		self.buff.set_current_block(b);
+	}
+
 	pub fn addr(&self) -> usize {
 		self.buff.addr()
 	}
@@ -404,6 +408,10 @@ impl StreamBuffer {
 
 	pub fn current_block(&self) -> usize {
 		self.cur_pos
+	}
+
+	pub fn set_current_block(&mut self, b: usize) {
+		self.cur_pos = b % self.block_cnt;
 	}
 
 	pub fn write_block(&mut self, buf: &[u8]) -> Result<usize, Error> {

@@ -1233,18 +1233,39 @@ impl IntelHDA {
 			self.regs.ssync.write(0);
 		}
 
-		output.run();
+		// Robust stream start. On this AMD controller simply setting RUN is
+		// unreliable (POS stays 0, no error) — the DMA sometimes won't begin
+		// transferring. Use the HDA SSYNC gate/release sequence (set the
+		// stream's SSYNC bit, set RUN, then clear SSYNC to release) and verify
+		// POS actually advances, retrying a few times.
+		let ssync_bit: u32 = 1 << self.num_input_streams(); // output stream 0 descriptor index
+		let mut started = false;
+		for attempt in 0..6u32 {
+			output.stop();
+			output.clear_interrupts();
+			super::delay_us(300);
 
-		// Wait for stream to start running
-		for i in 0..10000u32 {
-			if output.control() & (1 << 1) != 0 {
+			// Gate this stream, set RUN, then release the gate.
+			self.regs.ssync.write(self.regs.ssync.read() | ssync_bit);
+			super::delay_us(50);
+			output.run();
+			super::delay_us(100);
+			self.regs.ssync.write(self.regs.ssync.read() & !ssync_bit);
+
+			// Verify POS advances.
+			let p0 = output.link_position();
+			super::delay_us(3000);
+			let p1 = output.link_position();
+			flog!("  start attempt {}: ssync_bit={:#X} POS {:#X}->{:#X} CTL={:#X} STS={:#X}",
+				attempt, ssync_bit, p0, p1, output.control(), output.status());
+			if p1 != p0 {
+				started = true;
 				break;
 			}
-			super::delay_us(10);
-			if i == 9999 {
-				flog!("WARNING: timeout waiting for output stream to start running");
-				println!("WARNING: timeout waiting for output stream to start running");
-			}
+		}
+		if !started {
+			flog!("  WARNING: output DMA did not start (POS not advancing) after retries");
+			println!("WARNING: output DMA did not start");
 		}
 
 		flog!("setup_output_stream() done: CTL={:#X} STS={:#X} POS={:#X}",
@@ -1283,7 +1304,9 @@ impl IntelHDA {
 		let actual = periods * 48000.0 / total_frames as f64;
 		for i in 0..total_frames {
 			let phase = 2.0 * core::f64::consts::PI * periods * (i as f64) / (total_frames as f64);
-			let s = (libm::sin(phase) * 16000.0) as i16;
+			// Low amplitude (~9%): the Framework 13 AMD speaker buzzes at high
+			// volume (a known hardware issue) and TTS does not need to be loud.
+			let s = (libm::sin(phase) * 3000.0) as i16;
 			let b = s.to_le_bytes();
 			unsafe {
 				let p = (base + i * 4) as *mut u8;
@@ -1341,6 +1364,23 @@ impl IntelHDA {
 		flog!("play_for_wraps done: wraps={} polls={} final POS={:#X} CTL={:#X} STS={:#X}",
 			wrap_count, polls, output.link_position(), output.control(), output.status());
 		super::filelog::flush();
+	}
+
+	/// Align the producer write cursor to `lead` blocks ahead of the DMA read
+	/// position, so a freshly-streamed clip plays in order from its first
+	/// sample. Without this the start of short clips can be written into ring
+	/// blocks the DMA already passed (missed first letter / clip starts mid-way).
+	pub fn align_write_cursor(&mut self, lead: usize) {
+		let pos = match self.get_output_stream_descriptor(0) {
+			Some(o) => o.link_position() as usize,
+			None => return,
+		};
+		if let Some(o) = self.output_streams.get_mut(0) {
+			let bs = o.block_size().max(1);
+			let nb = o.block_count().max(1);
+			let open_block = (pos / bs) % nb;
+			o.set_current_block((open_block + lead) % nb);
+		}
 	}
 
 	/// Stop output stream 0 DMA so the controller does not keep playing
@@ -1439,12 +1479,19 @@ impl IntelHDA {
 				flog!("    set {:X?} input gain={:#X} (0dB)", addr, in_0db);
 			}
 
-			// Output amp
+			// Output amp. Attenuate ~40% of the available steps below the 0 dB
+			// reference to keep volume modest (the Framework 13 AMD speaker
+			// buzzes when driven hard, and TTS needn't be loud). Widgets with
+			// no gain steps (fixed amps) are unaffected.
 			if (caps & (1 << 2)) != 0 {
 				let out_caps = self.cmd.cmd12(addr, 0xF00, 0x12);
-				let out_0db = (out_caps & 0x7f) as u8; // Offset = 0dB
-				self.set_amplifier_gain_mute(addr, true, false, left, right, index, mute, out_0db);
-				flog!("    set {:X?} output gain={:#X} (0dB)", addr, out_0db);
+				let out_0db = (out_caps & 0x7f) as u8;        // Offset = 0 dB step
+				let numsteps = ((out_caps >> 8) & 0x7f) as u8; // gain steps available
+				let attn = ((numsteps as u16 * 2) / 5) as u8;  // 40% of range
+				let gain = out_0db.saturating_sub(attn);
+				self.set_amplifier_gain_mute(addr, true, false, left, right, index, mute, gain);
+				flog!("    set {:X?} output gain={:#X} (0dB={:#X} steps={} attn={})",
+					addr, gain, out_0db, numsteps, attn);
 			}
 		}
 

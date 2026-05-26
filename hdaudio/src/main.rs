@@ -226,13 +226,6 @@ fn enumerate_and_test_outputs(device: &mut hda::IntelHDA) {
         return;
     }
 
-    // Set up the output stream hardware (once)
-    device.setup_output_stream();
-
-    // ---- STATIC-TONE DIAGNOSTIC ----
-    // Pre-fill the whole cyclic buffer with a seamless looping sine and let the
-    // DMA loop it. This removes the producer/consumer streaming variable so we
-    // can determine whether the DAC produces a clean continuous tone at all.
     // Target the INTERNAL SPEAKER (the device the blind user needs for TTS).
     let mut speaker_idx = 0usize;
     let mut found_speaker = false;
@@ -253,17 +246,35 @@ fn enumerate_and_test_outputs(device: &mut hda::IntelHDA) {
     match device.configure_pin_for_output(speaker) {
         Some(dac) => {
             println!("  speaker configured via DAC {:02X}:{:02X}", dac.0, dac.1);
-            device.fill_static_tone(440.0);
-            println!("  PLAYING static ~440Hz tone (~4 s, looping buffer)...");
-            device.play_for_wraps(12);
-            println!("  static tone done.");
 
-            // Validate the STREAMING path (what a TTS engine needs): feed an
-            // 880 Hz tone block-by-block through write_to_output. If audible as
-            // a distinct higher tone, real-time streaming works.
-            println!("  STREAMING an 880Hz tone (~3 s) via write_to_output...");
-            play_short_tone(device, 3.0, 880.0);
-            println!("  streamed tone done.");
+            // Set up + START the output stream AFTER the DAC converter is bound
+            // to it. Starting RUN before a converter consumes the stream lets
+            // the FIFO fill and the DMA stall (POS stuck at 0) — a race.
+            device.setup_output_stream();
+
+            // Greeting so it's audibly working.
+            println!("  SPEAKING via fry: \"hello uefi\"");
+            speak_fry(device, "hello uefi");
+
+            // Interactive prompt: speak whatever the user types.
+            loop {
+                println!("");
+                println!("Type text to speak (letters a-z and spaces, max 32; empty line = quit):");
+                let line = read_line_console();
+                let cleaned: String = line
+                    .trim()
+                    .to_ascii_lowercase()
+                    .chars()
+                    .filter(|c| (*c >= 'a' && *c <= 'z') || *c == ' ')
+                    .take(32)
+                    .collect();
+                if cleaned.trim().is_empty() {
+                    println!("(done)");
+                    break;
+                }
+                println!("Speaking: \"{}\"", cleaned);
+                speak_fry(device, &cleaned);
+            }
 
             // Stop the stream so the controller doesn't play freed memory
             // (garbage noise) after we return to the UEFI shell.
@@ -280,11 +291,193 @@ fn enumerate_and_test_outputs(device: &mut hda::IntelHDA) {
     println!("==============================================");
 }
 
+/// Read a line from the UEFI console input protocol (ConIn). The UEFI std
+/// target does not wire up std::io::stdin to the keyboard, so we poll
+/// ReadKeyStroke directly. Echoes typed characters; returns the line without
+/// the trailing newline (empty string if Enter is pressed with no input).
+fn read_line_console() -> String {
+    use r_efi::efi;
+    use r_efi::protocols::simple_text_input as sti;
+    use std::io::Write;
+
+    let mut s = String::new();
+    unsafe {
+        let st = std::os::uefi::env::system_table().as_ptr() as *mut efi::SystemTable;
+        if st.is_null() { return s; }
+        let con_in = (*st).con_in;
+        if con_in.is_null() { return s; }
+        loop {
+            let mut key = sti::InputKey::default();
+            let status = ((*con_in).read_key_stroke)(con_in, &mut key);
+            if status.is_error() {
+                // EFI_NOT_READY: no key pending — poll again shortly.
+                crate::hda::delay_us(2000);
+                continue;
+            }
+            let ch = key.unicode_char;
+            if ch == 0x000D {            // Enter (carriage return)
+                println!("");
+                break;
+            } else if ch == 0x0008 {     // Backspace
+                if s.pop().is_some() {
+                    print!("\u{8} \u{8}");
+                    let _ = std::io::stdout().flush();
+                }
+            } else if (0x20..0x7F).contains(&ch) {
+                let c = ch as u8 as char;
+                s.push(c);
+                print!("{}", c);         // echo
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+    s
+}
+
+/// Write one 2048-byte audio block to output stream 0, retrying while the ring
+/// is full (paced against the DMA read position).
+/// Returns false if the write stalled (DMA not draining the ring) so the
+/// caller can abort the utterance fast instead of hanging.
+fn write_block_blocking(device: &mut hda::IntelHDA, block: &[u8]) -> bool {
+    let mut retries = 0u32;
+    loop {
+        match device.write_to_output(0, block) {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                retries += 1;
+                if retries == 8_000 {
+                    let (ctl, sts, pos) = device.output_stream_diag(0);
+                    crate::flog!("write STALL: retries={} SD_CTL={:#X} SD_STS={:#X} POS={:#X}", retries, ctl, sts, pos);
+                    crate::hda::filelog::flush();
+                }
+                if retries > 12_000 {
+                    crate::flog!("write_block_blocking: stalled, aborting utterance");
+                    crate::hda::filelog::flush();
+                    return false;
+                }
+                hda::delay_us(100);
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Synthesize `text` with the `fry` TTS crate and stream it to the speaker.
+///
+/// `fry` outputs MONO i16 at 22050 Hz and only has lowercase a-z + space
+/// samples, so the text is lowercased. We resample on the fly to the stream's
+/// 48000 Hz stereo format and attenuate to a comfortable volume.
+fn speak_fry(device: &mut hda::IntelHDA, text: &str) {
+    const FRY_STRIDE: usize = 20810;   // samples per letter slot in fry's buffer
+    const FRY_BUF_LEN: usize = 665920; // fry::MAX_BUFFER_SIZE (i16 samples)
+    const FRY_RATE: u64 = 22050;
+    const OUT_RATE: u64 = 48000;
+    const BLOCK: usize = 2048;         // bytes; 512 stereo frames
+
+    let mut buf: Vec<i16> = vec![0i16; FRY_BUF_LEN];
+    let arr: &mut [i16; FRY_BUF_LEN] = match (&mut buf[..]).try_into() {
+        Ok(a) => a,
+        Err(_) => { println!("fry: buffer size mismatch"); return; }
+    };
+
+    let lowered = text.to_ascii_lowercase();
+    let letters = match fry::tts(&lowered, arr) {
+        Some(n) => n,
+        None => { println!("fry: tts() failed (too long or unsupported char)"); return; }
+    };
+    // Each fry letter slot is 20810 samples but only part is real audio (the
+    // rest is silence), and letters vary in length ('e'~2.7k vs 'w'~7.3k). Trim
+    // each letter DYNAMICALLY to its actual audio extent + a short decay tail,
+    // then a small inter-letter gap, so spelling is snappy without cutting long
+    // letters. A space becomes a brief word-separator pause.
+    const LETTER_DATA: usize = 10405; // samples of audio per letter in fry's data
+    const TAIL: usize = 700;          // decay samples kept after the audio ends
+    const THRESH: i32 = 200;          // amplitude considered "audio"
+    const MAX_LEN: usize = 9000;      // safety cap per letter
+    const LETTER_GAP: usize = 1100;   // short silence between letters (~0.05 s)
+    const LEAD_IN: usize = 1200;      // brief silence lead-in (margin against clipping the start)
+
+    let mut mono: Vec<i16> = Vec::with_capacity(LEAD_IN + letters * 6000);
+    for _ in 0..LEAD_IN {
+        mono.push(0);
+    }
+    for (l, ch) in lowered.chars().enumerate() {
+        let start = l * FRY_STRIDE;
+        if ch == ' ' {
+            // Word separator: a slightly longer pause, no audio.
+            for _ in 0..(LETTER_GAP * 3) { mono.push(0); }
+            continue;
+        }
+        // Find this letter's real audio extent (last sample above threshold).
+        let end = (start + LETTER_DATA).min(buf.len());
+        let mut ext = 0usize;
+        for i in start..end {
+            if (buf[i] as i32).abs() > THRESH {
+                ext = i - start + 1;
+            }
+        }
+        let audio_len = (ext + TAIL).min(LETTER_DATA).min(MAX_LEN);
+        for k in 0..audio_len {
+            mono.push(*buf.get(start + k).unwrap_or(&0));
+        }
+        for _ in 0..LETTER_GAP {
+            mono.push(0);
+        }
+    }
+    println!("  fry: {} letters -> {} mono samples (dynamic trim)", letters, mono.len());
+
+    // Start writing just ahead of the DMA read pointer so the clip plays in
+    // order from the first sample (critical for short clips).
+    device.align_write_cursor(2);
+    crate::flog!("speak_fry: aligned, streaming {} mono samples", mono.len());
+    crate::hda::filelog::flush();
+
+    let out_frames = (mono.len() as u64 * OUT_RATE / FRY_RATE) as usize;
+    let mut block = [0u8; BLOCK];
+    let mut bi = 0usize;
+
+    for o in 0..out_frames {
+        // Linear-interpolated resample 22050 -> 48000.
+        let pos = (o as u64 * FRY_RATE) as f64 / OUT_RATE as f64;
+        let i0 = pos as usize;
+        let frac = pos - i0 as f64;
+        let s0 = *mono.get(i0).unwrap_or(&0);
+        let s1 = *mono.get(i0 + 1).unwrap_or(&s0);
+        let interp = s0 as f64 + (s1 as f64 - s0 as f64) * frac;
+        // Attenuate (~1/2) for a comfortable but clearly audible level.
+        let s = (interp as i32 / 2) as i16;
+        let b = s.to_le_bytes();
+        block[bi] = b[0];
+        block[bi + 1] = b[1];
+        block[bi + 2] = b[0]; // duplicate to right channel
+        block[bi + 3] = b[1];
+        bi += 4;
+        if bi == BLOCK {
+            if !write_block_blocking(device, &block) { return; }
+            bi = 0;
+        }
+    }
+    if bi > 0 {
+        for k in bi..BLOCK { block[k] = 0; }
+        let _ = write_block_blocking(device, &block);
+    }
+
+    // Fill the WHOLE ring (32 blocks) + margin with silence so the DMA can't
+    // replay leftover clip audio while we wait for the next keystroke.
+    let silence = [0u8; BLOCK];
+    for _ in 0..40 {
+        if !write_block_blocking(device, &silence) { break; }
+    }
+    hda::delay_us(150_000);
+    crate::flog!("speak_fry: done ({} blocks of audio streamed)", out_frames / (BLOCK / 4));
+    crate::hda::filelog::flush();
+}
+
 /// Play a sine wave tone for a given duration and frequency.
 /// Format: 48000 Hz, 16-bit signed PCM, stereo (mandatory HDA format per spec).
 fn play_short_tone(device: &mut hda::IntelHDA, duration_secs: f64, freq: f64) {
     const SAMPLE_RATE: f64 = 48000.0;
-    const AMPLITUDE: f64 = 16384.0;    // ~50% volume
+    const AMPLITUDE: f64 = 3000.0;     // ~9% volume (Framework speaker buzzes loud)
     const CHANNELS: usize = 2;
     const BYTES_PER_SAMPLE: usize = 2;  // 16-bit
     const FRAME_SIZE: usize = CHANNELS * BYTES_PER_SAMPLE; // 4 bytes
@@ -336,9 +529,11 @@ fn play_short_tone(device: &mut hda::IntelHDA, duration_secs: f64, freq: f64) {
         }
     }
 
-    // Write a block of silence to flush out the last tone samples
+    // Overwrite the ENTIRE cyclic ring (32 blocks) with silence so the DMA
+    // can't replay leftover tone samples after we stop (the "end blip"). +4
+    // margin for the producer staying ahead of the DMA read pointer.
     let silence = [0u8; BLOCK_SIZE];
-    for _ in 0..4 {
+    for _ in 0..36 {
         let mut retries = 0u32;
         loop {
             match device.write_to_output(0, &silence) {
