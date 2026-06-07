@@ -1,4 +1,11 @@
+#![no_std]
 #![feature(int_roundings)]
+
+// `format!` lives in alloc; the lib path reaches it once in `physmap`.
+// `extern crate alloc` here keeps the crate working in both no_std
+// builds and std consumers (std re-exports the same alloc).
+#[macro_use]
+extern crate alloc;
 
 use syscall::PAGE_SIZE;
 use syscall::error::{Error, Result, EINVAL};

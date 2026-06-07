@@ -1,6 +1,6 @@
-use std::mem::{self, MaybeUninit};
-use std::ops::{Deref, DerefMut};
-use std::{ptr, slice};
+use core::mem::{self, MaybeUninit};
+use core::ops::{Deref, DerefMut};
+use core::{ptr, slice};
 
 use syscall::PAGE_SIZE;
 
