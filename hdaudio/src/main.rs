@@ -1,14 +1,42 @@
 #![allow(dead_code)]
 #![feature(uefi_std)]
 
+// `lib.rs` and this `main.rs` are sibling crate roots: the library and
+// the standalone `ihdad.efi` binary. Cargo compiles each separately, so
+// the binary needs to declare the same module tree the library does in
+// order for shared source files (under `src/hda/`, `src/pcid/`, ...) —
+// which now reference `crate::env`, `crate::io_compat`, `crate::sync_compat`,
+// and `crate::ihd_println!` — to resolve when compiled as part of this
+// binary crate. Under `--features binary` (which implies `std`) every
+// `cfg(feature = "std")` branch in those modules is taken, so this main
+// crate sees the same compiled-out paths the lib does.
+#[macro_use]
+extern crate alloc;
+
+mod env;
+mod io_compat;
+mod sync_compat;
+
 mod hda;
 mod pcid;
 mod efidma;
 
+// Mirror lib.rs's `ihd_println!` / `ihd_print!` macros so library code
+// that uses them compiles here too. In this (binary) crate the std
+// branch always fires — main.rs requires `feature = "std"` to build
+// anyway via the `binary` feature in Cargo.toml.
+#[macro_export]
+macro_rules! ihd_println {
+    ($($arg:tt)*) => {{ std::println!($($arg)*) }};
+}
+#[macro_export]
+macro_rules! ihd_print {
+    ($($arg:tt)*) => {{ std::print!($($arg)*) }};
+}
+
 
 use pcid::*;
 use crate::state::*;
-
 
 
 
@@ -104,17 +132,20 @@ fn get_int_method(pcid_handle: &mut PcidServerHandle) -> Option<File> {
 fn main() {
   // Initialize file logging early so PCI-scan-phase diagnostics are captured.
   hda::filelog::init();
+  println!("Initializing flite TTS voice (cmu_us_slt)...");
+  let voice = flite_uefi::init().expect("voice");
+  println!("flite voice registered.");
   println!("Attempt to create PCI channels: ");
   let (mut pci_from_write, pci_from_read) = bounded(1024);
   println!("OK");
   let (pci_to_write, mut pci_to_read) = bounded(1024);
   println!("OK2");
   let drivers = pci_main(&mut pci_from_write, &mut pci_to_read);
-  hda_main(pci_to_write, pci_from_read, pci_from_write, pci_to_read, drivers);
+  hda_main(pci_to_write, pci_from_read, pci_from_write, pci_to_read, drivers, voice);
   println!("Sucessfully initialized Intel HD Audio buffers. TBC!");
 }
 
-fn hda_main(pci_to_write: Sender<Vec<u8>>, pci_from_read: Receiver<Vec<u8>>, pci_from_write: Sender<Vec<u8>>, pci_to_read: Receiver<Vec<u8>>, drivers: Vec<(DriverHandler, SubdriverArguments)>) {
+fn hda_main(pci_to_write: Sender<Vec<u8>>, pci_from_read: Receiver<Vec<u8>>, pci_from_write: Sender<Vec<u8>>, pci_to_read: Receiver<Vec<u8>>, drivers: Vec<(DriverHandler, SubdriverArguments)>, voice: flite_uefi::Voice) {
   std::println!("Opening Intel HDA");
 
   // Print all found HDA controllers for diagnostics
@@ -196,10 +227,26 @@ let address = unsafe {
   );
   println!("PciIo DMA mapping available: {}", dma_ok);
 
+  // Recover a PCIe function whose DMA/bus-master state machine was wedged by a
+  // power-off mid-DMA (symptom on next boot: HDA controller + codec reset fine
+  // but the DMA engine reads nothing from memory). GCTL controller reset does
+  // not clear this; a PCIe Function Level Reset does. Harmless on a clean boot
+  // (we restore BAR0 + command reg and re-init the controller from scratch).
+  if dma_ok {
+    let flr = efidma::function_level_reset(bar_ptr);
+    println!("PCIe FLR performed: {}", flr);
+
+    // Force the real DMA buffers onto fresh IOVAs the previous (possibly
+    // crashed mid-DMA) boot never used, to dodge stale AMD-Vi IOTLB entries
+    // for the firmware's deterministically-reused low IOVAs. 48 pages clears
+    // the ~18-page range the driver allocates (BDL + 16-page audio + pos).
+    efidma::bump_iovas(48);
+  }
+
 	let mut device = unsafe { hda::IntelHDA::new(address, vend_prod).expect("ihdad: failed to allocate device") };
   println!("Created intel HDA device; starting pin enumeration test...");
 
-  enumerate_and_test_outputs(&mut device);
+  enumerate_and_test_outputs(&mut device, &voice);
 
   println!("Output pin enumeration complete.");
 }
@@ -207,7 +254,7 @@ let address = unsafe {
 /// Enumerate all output pins and play a short tone on each one.
 /// This allows the user to identify which pin produces audible output
 /// by correlating the on-screen pin index with what they hear.
-fn enumerate_and_test_outputs(device: &mut hda::IntelHDA) {
+fn enumerate_and_test_outputs(device: &mut hda::IntelHDA, voice: &flite_uefi::Voice) {
     let pin_count = device.output_pin_count();
 
     println!("==============================================");
@@ -252,28 +299,34 @@ fn enumerate_and_test_outputs(device: &mut hda::IntelHDA) {
             // the FIFO fill and the DMA stall (POS stuck at 0) — a race.
             device.setup_output_stream();
 
-            // Greeting so it's audibly working.
-            println!("  SPEAKING via fry: \"hello uefi\"");
-            speak_fry(device, "hello uefi");
+            // Spoken greeting so a blind user can confirm audio + TTS are
+            // working before they even type anything.
+            let greeting = "Welcome to U E F I text to speech. \
+                            Type a message and press enter, or press enter alone to quit.";
+            println!("  SPEAKING via flite: \"{}\"", greeting);
+            speak_flite(device, voice, greeting);
 
-            // Interactive prompt: speak whatever the user types.
+            // Interactive prompt loop: synthesize whatever the user types.
             loop {
                 println!("");
-                println!("Type text to speak (letters a-z and spaces, max 32; empty line = quit):");
+                println!("Type text to speak (printable ASCII, max 256; empty line = quit):");
+                // Speak the prompt itself so a blind user knows when to type.
+                speak_flite(device, voice, "Type a message and press enter.");
+
                 let line = read_line_console();
                 let cleaned: String = line
                     .trim()
-                    .to_ascii_lowercase()
                     .chars()
-                    .filter(|c| (*c >= 'a' && *c <= 'z') || *c == ' ')
-                    .take(32)
+                    .filter(|c| (*c as u32) >= 0x20 && (*c as u32) < 0x7F)
+                    .take(256)
                     .collect();
-                if cleaned.trim().is_empty() {
+                if cleaned.is_empty() {
                     println!("(done)");
+                    speak_flite(device, voice, "Goodbye.");
                     break;
                 }
                 println!("Speaking: \"{}\"", cleaned);
-                speak_fry(device, &cleaned);
+                speak_flite(device, voice, &cleaned);
             }
 
             // Stop the stream so the controller doesn't play freed memory
@@ -360,6 +413,138 @@ fn write_block_blocking(device: &mut hda::IntelHDA, block: &[u8]) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// Synthesize `text` with the `flite-uefi` crate's `cmu_us_slt` voice and
+/// stream it to the HDA speaker.
+///
+/// flite hands us 16-bit signed PCM in whatever rate the registered voice
+/// produces (16000 Hz mono for `cmu_us_slt`). We downmix any extra channels
+/// to mono, linearly resample to the controller's required 48000 Hz, and
+/// duplicate to stereo as the HDA stream is configured for 2 ch.
+///
+/// Mirrors `speak_fry`'s pacing so the DMA ring stays in lockstep with the
+/// caller and so the start of the utterance isn't clipped.
+fn speak_flite(device: &mut hda::IntelHDA, voice: &flite_uefi::Voice, text: &str) {
+    const OUT_RATE: u64 = 48000;
+    const BLOCK: usize = 2048;        // bytes; 512 stereo frames
+    const LEAD_IN_FRAMES: usize = 1200;
+    const TAIL_BLOCKS: usize = 40;    // > NUM_SUB_BUFFS so the ring is fully wiped
+
+    let wave = match voice.synthesize(text) {
+        Some(w) => w,
+        None => {
+            println!("flite: synthesize(\"{}\") returned None", text);
+            return;
+        }
+    };
+
+    let in_rate = wave.sample_rate() as u64;
+    let in_channels = wave.num_channels().max(1) as usize;
+    let samples = wave.samples();
+    if in_rate == 0 || samples.is_empty() {
+        println!("flite: empty wave (rate={}, samples={})", in_rate, samples.len());
+        return;
+    }
+
+    let in_frames = samples.len() / in_channels;
+    let out_frames = (in_frames as u64 * OUT_RATE / in_rate) as usize;
+
+    println!(
+        "  flite: \"{}\" -> {} in-frames @ {} Hz, {} ch  ->  {} out-frames @ 48000 Hz stereo",
+        text, in_frames, in_rate, in_channels, out_frames
+    );
+
+    // Align the write cursor just ahead of the DMA read cursor so the first
+    // sample is what plays first (critical for short utterances).
+    device.align_write_cursor(2);
+    crate::flog!(
+        "speak_flite: aligned, streaming {} samples ({} ch @ {} Hz)",
+        samples.len(),
+        in_channels,
+        in_rate
+    );
+    crate::hda::filelog::flush();
+
+    let mut block = [0u8; BLOCK];
+    let mut bi: usize = 0;
+
+    // Brief silence lead-in so we don't clip the start of the first phoneme
+    // while the DAC settles.
+    for _ in 0..LEAD_IN_FRAMES {
+        block[bi] = 0;
+        block[bi + 1] = 0;
+        block[bi + 2] = 0;
+        block[bi + 3] = 0;
+        bi += 4;
+        if bi == BLOCK {
+            if !write_block_blocking(device, &block) {
+                return;
+            }
+            bi = 0;
+        }
+    }
+
+    // Mono mix of one input frame (downmix multi-channel by averaging).
+    let frame_mono = |f: usize| -> i32 {
+        if f >= in_frames {
+            return 0;
+        }
+        let base = f * in_channels;
+        if in_channels == 1 {
+            samples[base] as i32
+        } else {
+            let mut s: i32 = 0;
+            for c in 0..in_channels {
+                s += samples[base + c] as i32;
+            }
+            s / in_channels as i32
+        }
+    };
+
+    let in_rate_f = in_rate as f64;
+    let out_rate_f = OUT_RATE as f64;
+    for o in 0..out_frames {
+        // Linear-interpolated resample in -> 48 kHz.
+        let pos = o as f64 * in_rate_f / out_rate_f;
+        let i0 = pos as usize;
+        let frac = pos - i0 as f64;
+        let s0 = frame_mono(i0);
+        let s1 = frame_mono(i0 + 1);
+        let interp = s0 as f64 + (s1 - s0) as f64 * frac;
+        // Attenuate ~50% — Framework's internal speaker is loud at full scale.
+        let s = (interp as i32 / 2).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+        let b = s.to_le_bytes();
+        block[bi] = b[0];
+        block[bi + 1] = b[1];
+        block[bi + 2] = b[0]; // duplicate to right channel
+        block[bi + 3] = b[1];
+        bi += 4;
+        if bi == BLOCK {
+            if !write_block_blocking(device, &block) {
+                return;
+            }
+            bi = 0;
+        }
+    }
+    if bi > 0 {
+        for k in bi..BLOCK {
+            block[k] = 0;
+        }
+        let _ = write_block_blocking(device, &block);
+    }
+
+    // Wipe the ring with silence so the DMA can't loop back over the tail of
+    // this utterance while we wait for the next keystroke.
+    let silence = [0u8; BLOCK];
+    for _ in 0..TAIL_BLOCKS {
+        if !write_block_blocking(device, &silence) {
+            break;
+        }
+    }
+    hda::delay_us(150_000);
+    crate::flog!("speak_flite: done ({} out frames streamed)", out_frames);
+    crate::hda::filelog::flush();
 }
 
 /// Synthesize `text` with the `fry` TTS crate and stream it to the speaker.
