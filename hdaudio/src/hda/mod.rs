@@ -6,6 +6,7 @@ pub mod node;
 pub mod cmdbuff;
 pub mod io;
 pub mod filelog;
+pub mod quirks;
 
 pub use self::stream::*;
 pub use self::node::*;
@@ -21,7 +22,12 @@ pub use self::node::*;
 #[inline(never)]
 pub fn delay_us(us: u64) {
     unsafe {
-        let st = std::os::uefi::env::system_table().as_ptr() as *mut r_efi::efi::SystemTable;
+        // Source of truth for the EFI System Table — see crate::env. Std
+        // mode forwards to std::os::uefi::env::try_system_table(); no_std
+        // mode reads the consumer-supplied pointer. Returns null if not
+        // initialised, hence the null check below before we touch
+        // BootServices.Stall.
+        let st = crate::env::system_table() as *mut r_efi::efi::SystemTable;
         if !st.is_null() {
             let bs = (*st).boot_services;
             if !bs.is_null() {
