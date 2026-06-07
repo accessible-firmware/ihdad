@@ -1,16 +1,19 @@
 #![allow(dead_code)]
 
-use std::cmp;
-use std::cmp::min;
-use std::collections::BTreeMap;
-use std::fmt::Write;
-use std::str;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::io::ErrorKind;
-use std::io::Result;
-use std::io::Error;
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use core::cmp;
+use core::cmp::min;
+use alloc::collections::BTreeMap;
+use core::fmt::Write;
+use core::str;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use crate::io_compat::ErrorKind;
+use crate::io_compat::Result;
+use crate::io_compat::Error;
 use core::alloc::Layout;
-use std::alloc::alloc_zeroed;
+use alloc::alloc::alloc_zeroed;
 
 //use syscall::error::{Error, ErrorKind::PermissionsDenied, "No access", ErrorKind::Other, "Bad F", ErrorKind::InvalidInput, "input failed to process"};
 //use syscall::flag::{SEEK_SET, SEEK_CUR, SEEK_END};
@@ -32,6 +35,7 @@ use super::BitsPerSample;
 use super::CommandBuffer;
 use super::HDANode;
 use super::OutputStream;
+use super::quirks::{Quirks, PositionSource, StreamStart, OutputGain};
 
 // GCTL - Global Control
 const CRST:   u32 = 1 << 0; // 1 bit
@@ -128,6 +132,11 @@ struct Regs {
 pub struct IntelHDA {
 	vend_prod: u32,
 
+	/// Per-controller workarounds, resolved from `vend_prod` in `new()`.
+	/// Read throughout bring-up so all chipset decisions live in one place
+	/// (see `super::quirks`).
+	quirks: Quirks,
+
 	base: usize,
 	regs: &'static mut Regs,
 
@@ -182,18 +191,26 @@ impl IntelHDA {
     };
     let buff_desc_virt: usize = buff_desc_host;
 		let buff_desc = &mut *(buff_desc_host as *mut [BufferDescriptorListEntry;256]);
-    //println!("BUF");
+    //crate::ihd_println!("BUF");
 
     let cmd_layout = Layout::from_size_align(0x1000, 0x1000).unwrap();
     let cmd_buff_address: *mut u8 = unsafe { alloc_zeroed(cmd_layout) };
     let cmd_buff_virt: usize = cmd_buff_address as usize;
-    //println!("CMDBUF");
+    //crate::ihd_println!("CMDBUF");
 
-		//println!("Virt: {:016X}, Phys: {:016X}", buff_desc_virt, buff_desc_phys);
-		//println!("Virt: {:016X}, Phys: {:016X}", cmd_buff_virt, cmd_buff_address);
+		//crate::ihd_println!("Virt: {:016X}, Phys: {:016X}", buff_desc_virt, buff_desc_phys);
+		//crate::ihd_println!("Virt: {:016X}, Phys: {:016X}", cmd_buff_virt, cmd_buff_address);
+
+		// Resolve the per-chipset quirk profile up front from the PCI ids
+		// (vend_prod = (vendor << 16) | device). Everything downstream —
+		// reset, command interface, stream start, position tracking — reads
+		// `self.quirks` instead of re-matching the ids.
+		let quirks = Quirks::for_controller((vend_prod >> 16) as u16, vend_prod as u16);
+		flog!("IntelHDA::new(): resolved quirks {:?}", quirks);
 
 		let mut module = IntelHDA {
 			vend_prod: vend_prod,
+			quirks: quirks,
 			base: base,
 			regs: regs,
 
@@ -247,11 +264,9 @@ impl IntelHDA {
 		// Use CORB/RIRB for all hardware by default.
 		// Immediate Command Interface is intended for BIOS/firmware,
 		// not OS drivers, and is not supported by all controllers
-		// (especially AMD). Only fall back to immediate for known-broken CORB/RIRB.
-		let use_immediate_command_interface = match self.vend_prod {
-			0x8086_2668 => true, // ICH6: known broken CORB/RIRB
-			_ => false,
-		};
+		// (especially AMD). Only fall back to immediate for known-broken
+		// CORB/RIRB (ICH6) — see `super::quirks`.
+		let use_immediate_command_interface = self.quirks.immediate_command_interface;
 
 		flog!("init(): use_immediate_command_interface={} (vend_prod={:#010X})", use_immediate_command_interface, self.vend_prod);
 		self.cmd.init(use_immediate_command_interface);
@@ -430,14 +445,14 @@ impl IntelHDA {
 		flog!("enumerate(): codecs={:?} (count={})", codecs, codecs.len());
 		if codecs.is_empty() {
 			flog!("IHDA: No codecs found!");
-			println!("IHDA: No codecs found!");
+			crate::ihd_println!("IHDA: No codecs found!");
 		}
    for &codec in &codecs {
      flog!("--- Enumerating codec {} ---", codec);
-     println!("IHDA: Enumerating codec {}", codec);
+     crate::ihd_println!("IHDA: Enumerating codec {}", codec);
      let root = self.read_node((codec, 0));
      flog!("  root: {}", root);
-     println!("{}", root);
+     crate::ihd_println!("{}", root);
 
      let root_count = root.subnode_count;
      let root_start = root.subnode_start;
@@ -448,14 +463,31 @@ impl IntelHDA {
        flog!("  reading FG node ({}, {})", codec, fg_nid);
        let afg = self.read_node((codec, fg_nid));
        flog!("  FG: {}", afg);
-       println!("{}", afg);
+       crate::ihd_println!("{}", afg);
 
        // Only process Audio Function Groups (type 0x01)
        if afg.function_group_type != 0x01 {
          flog!("  SKIP FG {}:{:02X} (type=0x{:02X}, not AFG)", codec, fg_nid, afg.function_group_type);
-         println!("IHDA: Skip FG {}:{:02X} (type=0x{:02X}, not AFG)",
+         crate::ihd_println!("IHDA: Skip FG {}:{:02X} (type=0x{:02X}, not AFG)",
               codec, fg_nid, afg.function_group_type);
          continue;
+       }
+
+       // Function Reset the AFG (verb 0x7FF) before enumerating. A power-off
+       // while a stream was playing can leave the ALC295's stream converter
+       // wedged: on the next warm boot the controller + link are healthy and
+       // the codec answers verbs, but the converter never consumes the link
+       // stream, so the controller's SDLPIB never advances (RUN=1, no FIFO
+       // error, POS stuck at 0) — only a cold power-drain cleared it. A codec
+       // Function Reset returns the whole function group (all converters) to
+       // defaults; we then power it on and re-enumerate/reconfigure from
+       // scratch below, so this is safe on a clean boot too. Quirk-gated:
+       // it's an AMD-recovery measure and costs ~10 ms per AFG, so Intel
+       // skips it.
+       if self.quirks.function_reset_afg {
+         flog!("  Function Reset AFG ({}, {}) [verb 0x7FF]", codec, fg_nid);
+         self.cmd.cmd12((codec, fg_nid), 0x7FF, 0x00);
+         super::delay_us(10000); // codec needs time to complete the reset
        }
 
        // Power on AFG before enumerating widgets (required by spec;
@@ -472,7 +504,7 @@ impl IntelHDA {
          power_ticks += 1;
          if power_ticks > 50000 {
            flog!("  WARNING: AFG did not reach D0 (ps={:#X}) after {} ticks", ps, power_ticks);
-           println!("IHDA: Warning: AFG did not reach D0 (ps=0x{:X})", ps);
+           crate::ihd_println!("IHDA: Warning: AFG did not reach D0 (ps=0x{:X})", ps);
            break;
          }	
 
@@ -481,7 +513,7 @@ impl IntelHDA {
 				let afg_count = afg.subnode_count;
        let afg_start = afg.subnode_start;
        flog!("  AFG {}:{:02X} has {} widgets starting at NID {:#04X}", codec, fg_nid, afg_count, afg_start);
-       println!("IHDA: AFG {}:{:02X} has {} widgets starting at NID 0x{:02X}",
+       crate::ihd_println!("IHDA: AFG {}:{:02X} has {} widgets starting at NID 0x{:02X}",
             codec, fg_nid, afg_count, afg_start);
 
        for j in 0..afg_count {
@@ -489,8 +521,8 @@ impl IntelHDA {
          let mut widget = self.read_node((codec, nid));
          flog!("  Widget {:02X}:{:02X} type={:?} caps={:#010X} config_default={:#010X}",
               codec, nid, widget.widget_type(), widget.capabilities, widget.config_default);
-         println!("Widget {:02X}:{:02X} WT: {:?}", codec, nid, widget.widget_type());
-         println!("{}", widget);
+         crate::ihd_println!("Widget {:02X}:{:02X} WT: {:?}", codec, nid, widget.widget_type());
+         crate::ihd_println!("{}", widget);
          widget.is_widget = true;
          match widget.widget_type() {
            HDAWidgetType::AudioOutput => {
@@ -514,7 +546,7 @@ impl IntelHDA {
              flog!("    => PinComplex {:02X}: device={:?} port={:?} seq={} assoc={} color={:?} loc={:?}/{:?} config={:#010X}",
                   nid, dd, pc, seq, assoc, config.color(), config.gross_location(), config.geometric_location(), widget.config_default);
              flog!("       is_output()={} is_input()={}", config.is_output(), config.is_input());
-             println!("  Pin {:02X}: device={:?} port={:?} config=0x{:08X}",
+             crate::ihd_println!("  Pin {:02X}: device={:?} port={:?} config=0x{:08X}",
                   nid, config.default_device(), config.port_connectivity(),
                   widget.config_default);
              if config.is_output() {
@@ -542,22 +574,22 @@ impl IntelHDA {
    flog!("  input_pins={:?}", self.input_pins);
    flog!("  outputs(DACs)={:?}", self.outputs);
    flog!("  inputs(ADCs)={:?}", self.inputs);
-   println!("IHDA: Enumeration complete: {} outputs, {} inputs, {} output pins, {} input pins",
+   crate::ihd_println!("IHDA: Enumeration complete: {} outputs, {} inputs, {} output pins, {} input pins",
         self.outputs.len(), self.inputs.len(), self.output_pins.len(), self.input_pins.len());
    super::filelog::flush();
 	}
 
 	pub fn find_best_output_pin(&mut self) -> Option<WidgetAddr>{
 		flog!("find_best_output_pin(): output_pins={:?} (count={})", self.output_pins, self.output_pins.len());
-		print!("FBOP...");
+		crate::ihd_print!("FBOP...");
 		let outs = &self.output_pins;
 		if outs.len() == 0 {
 			flog!("  => None (no output pins at all!)");
-			println!("None!");
+			crate::ihd_println!("None!");
 			None
 		} else if outs.len() == 1 {
 			flog!("  => only one pin: {:?}", outs[0]);
-			println!("One({:?})", outs[0]);
+			crate::ihd_println!("One({:?})", outs[0]);
 			Some(outs[0])
 		} else {
 			flog!("  multiple output pins, searching by priority...");
@@ -585,21 +617,21 @@ impl IntelHDA {
 					let cd = widget.configuration_default();
 					flog!("    checking {:?}: seq={} device={:?} (want {:?})",
 						out, cd.sequence(), cd.default_device(), supported_device);
-					print!("look at...{out:?}...");
-					print!("Try read!");
-					print!("seq={},default={:?},supported={:?}", cd.sequence(), cd.default_device(), supported_device);
+					crate::ihd_print!("look at...{out:?}...");
+					crate::ihd_print!("Try read!");
+					crate::ihd_print!("seq={},default={:?},supported={:?}", cd.sequence(), cd.default_device(), supported_device);
 					if cd.sequence() == 0 && &cd.default_device() == supported_device {
 						flog!("    seq=0, device matches!");
-						print!("...seq=0,default=supported");
+						crate::ihd_print!("...seq=0,default=supported");
 						// Check for jack detect bit
 						let pin_caps = self.cmd.cmd12(widget.addr, 0xF00, 0x0C);
 						flog!("    pin_caps={:#010X} (jack_detect={})", pin_caps, (pin_caps >> 2) & 1);
-						print!("...PC={pin_caps:x}");
+						crate::ihd_print!("...PC={pin_caps:x}");
 						if pin_caps & (1 << 2) != 0 {
 							// Check for presence
 							let pin_sense = self.cmd.cmd12(widget.addr, 0xF09, 0);
 							flog!("    pin_sense={:#010X} (presence={})", pin_sense, (pin_sense >> 31) & 1);
-						print!("...PS={pin_sense:x}");
+						crate::ihd_print!("...PS={pin_sense:x}");
 							// Ignore "not plugged in"; send it?
 							// No! This causes instant-crash on FW13-AMD... but unsure why...
 							if pin_sense & (1 << 31) == 0 {
@@ -609,7 +641,7 @@ impl IntelHDA {
 							}
 						}
 						flog!("  => FOUND: {:?}", out);
-						println!("Found: {out:?}");
+						crate::ihd_println!("Found: {out:?}");
 						return Some(out);
 					}
 				}
@@ -645,7 +677,7 @@ impl IntelHDA {
 							}
 						}
 						flog!("  => FALLBACK match: {:?} ({:?})", out, cd.default_device());
-						println!("Fallback match: {out:?} ({:?})", cd.default_device());
+						crate::ihd_println!("Fallback match: {out:?} ({:?})", cd.default_device());
 						return Some(out);
 					}
 				}
@@ -653,14 +685,14 @@ impl IntelHDA {
 
 			flog!("  => LAST RESORT: returning first pin {:?}", outs[0]);
 			// Last resort: return first available output pin
-			println!("Last resort pin: {:?}", outs[0]);
+			crate::ihd_println!("Last resort pin: {:?}", outs[0]);
 			Some(outs[0])
 		}
 	}
 
 	pub fn find_path_to_dac(&self, addr: WidgetAddr) -> Option<Vec<WidgetAddr>>{
         flog!("find_path_to_dac({:?})", addr);
-        println!("[find_path_to_dac]: {addr:?}");
+        crate::ihd_println!("[find_path_to_dac]: {addr:?}");
 		let widget = self.widget_map.get(&addr).unwrap();
 		flog!("  widget type={:?} connections={:?} connection_default={}",
 			widget.widget_type(), widget.connections, widget.connection_default);
@@ -674,7 +706,7 @@ impl IntelHDA {
 			let mut path = self.find_path_to_dac(*connection)?;
 			path.insert(0, addr);
 			flog!("  path so far: {:?}", path);
-            println!("PATH: {path:?}");
+            crate::ihd_println!("PATH: {path:?}");
 			Some(path)
 		}
 	}
@@ -740,7 +772,7 @@ impl IntelHDA {
 		};
 
 		flog!("Best pin: {:01X}:{:02X}", outpin.0, outpin.1);
-		println!("Best pin: {:01X}:{:02X}", outpin.0, outpin.1);
+		crate::ihd_println!("Best pin: {:01X}:{:02X}", outpin.0, outpin.1);
 
 		let path = self.find_path_to_dac(outpin).unwrap();
 		let _ = outpin;
@@ -748,33 +780,33 @@ impl IntelHDA {
 		let dac = *path.last().unwrap();
 		let pin = *path.first().unwrap();
 
-		println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
 
 		// Set power state 0 (on) for all widgets in path
 		for &addr in &path {
 			self.set_power_state(addr, 0);
 		}
-		println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
 
 		// Pin enable (0x80 = headphone amp enable, 0x40 = output enable)
 		self.cmd.cmd12(pin, 0x707, 0xC0);
-		println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
 
 		// EAPD enable
 		self.cmd.cmd12(pin, 0x70C, 2);
-		println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
 
 		// Set DAC stream and channel
 		self.set_stream_channel(dac, 1, 0);
-		println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
 
 		self.update_sound_buffers();
-		println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
 
-		println!("Supported Formats: {:08X}", self.get_supported_formats((0,0x1)));
-		println!("Capabilities: {:08X}", self.get_capabilities(path[0]));
+		crate::ihd_println!("Supported Formats: {:08X}", self.get_supported_formats((0,0x1)));
+		crate::ihd_println!("Capabilities: {:08X}", self.get_capabilities(path[0]));
 
-		println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
 		// Create output stream
 		let output = self.get_output_stream_descriptor(0).unwrap();
 
@@ -794,7 +826,7 @@ impl IntelHDA {
 		//TODO: should validate?
 		self.cmd.cmd12(dac, 0xA00, 0);
 
-		println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
 		// Unmute and set gain to 0dB for input and output amplifiers on all widgets in path.
 		// Amp capabilities register (F00:0D / F00:12) layout per HDA spec Figure 91:
 		//   bits 6:0   = Offset (step index that produces 0 dB gain)
@@ -818,7 +850,7 @@ impl IntelHDA {
 				let output = false;
 				let input = true;
 				self.set_amplifier_gain_mute(addr, output, input, left, right, index, mute, in_0db);
-				println!("Set {:X?} input gain to 0x{:X} (0dB)", addr, in_0db);
+				crate::ihd_println!("Set {:X?} input gain to 0x{:X} (0dB)", addr, in_0db);
 			}
 
 			// Check for output amp
@@ -829,21 +861,21 @@ impl IntelHDA {
 				let output = true;
 				let input = false;
 				self.set_amplifier_gain_mute(addr, output, input, left, right, index, mute, out_0db);
-				println!("Set {:X?} output gain to 0x{:X} (0dB)", addr, out_0db);
+				crate::ihd_println!("Set {:X?} output gain to 0x{:X} (0dB)", addr, out_0db);
 			}
 		}
-		println!("Path to DAC ({}): {:X?}", line!(), path);
-		println!("{:?}", path.as_ptr());
-		println!("Try to drop path");
+		crate::ihd_println!("Path to DAC ({}): {:X?}", line!(), path);
+		crate::ihd_println!("{:?}", path.as_ptr());
+		crate::ihd_println!("Try to drop path");
 		// TODO: this line causes an instant crash
 		drop(path);
-		println!("Dropping path did nothing");
+		crate::ihd_println!("Dropping path did nothing");
 
 		//TODO: implement hda-verb?
 
 		output.run();
 
-		println!("Waiting for output 0 to start running...");
+		crate::ihd_println!("Waiting for output 0 to start running...");
 		// Poll with timeout and delay to prevent infinite hang
 		for i in 0..10000u32 {
 			if output.control() & (1 << 1) != 0 {
@@ -851,11 +883,11 @@ impl IntelHDA {
 			}
 			super::delay_us(10);
 			if i == 9999 {
-				println!("WARNING: timeout waiting for output stream to start running");
+				crate::ihd_println!("WARNING: timeout waiting for output stream to start running");
 			}
 		}
 
-		println!("Output 0 CONTROL {:#X} STATUS {:#X} POS {:#X}", output.control(), output.status(), output.link_position());
+		crate::ihd_println!("Output 0 CONTROL {:#X} STATUS {:#X} POS {:#X}", output.control(), output.status(), output.link_position());
 
 		let _ = output;
 	}
@@ -865,10 +897,10 @@ impl IntelHDA {
 
 		let outpin = self.find_best_output_pin().expect("IHDA: No output pins?!");
 
-		println!("Best pin: {:01X}:{:02X}", outpin.0, outpin.1);
+		crate::ihd_println!("Best pin: {:01X}:{:02X}", outpin.0, outpin.1);
 
 		let path = self.find_path_to_dac(outpin).unwrap();
-		println!("Path to DAC: {:X?}", path);
+		crate::ihd_println!("Path to DAC: {:X?}", path);
 
 		// Pin enable
 		self.cmd.cmd12((0,0xC), 0x707, 0x40);
@@ -882,8 +914,8 @@ impl IntelHDA {
 		self.update_sound_buffers();
 
 
-		println!("Supported Formats: {:08X}", self.get_supported_formats((0,0x1)));
-		println!("Capabilities: {:08X}", self.get_capabilities((0,0x1)));
+		crate::ihd_println!("Supported Formats: {:08X}", self.get_supported_formats((0,0x1)));
+		crate::ihd_println!("Capabilities: {:08X}", self.get_capabilities((0,0x1)));
 
 		let output = self.get_output_stream_descriptor(0).unwrap();
 
@@ -976,39 +1008,51 @@ impl IntelHDA {
 
 		self.regs.statests.write(0xFFFF);
 
-		// 3.3.7 - Controller Reset
-		// Clear CRST bit to enter reset
-		self.regs.gctl.writef(CRST, false);
-
-		// Poll until CRST reads 0 (reset entered), with 10us delays
-		// Timeout after 10000 iterations (~100ms)
-		for _ in 0..10000 {
-			if ! self.regs.gctl.readf(CRST) {
-				break;
+		// 3.3.7 - Controller Reset.
+		// A single GCTL CRST cycle does NOT reliably clear a stream DMA engine
+		// that was wedged by a power-off mid-transfer: on the Framework 13 AMD
+		// the next boot shows RUN=1, no error, but SDLPIB never advances (the
+		// engine fetches nothing from memory). Only a full cold power-drain
+		// cleared it. Mirror what recovers stuck controllers: run the full
+		// enter/exit reset cycle TWICE, holding the controller in reset ~1ms
+		// each time (well past the 100us spec minimum) so the link fully stops
+		// (BCLK off) and stuck DMA-engine state drains. Intel needs only the
+		// single spec cycle (quirk-gated via `double_controller_reset`).
+		let reset_cycles = if self.quirks.double_controller_reset { 2 } else { 1 };
+		for cycle in 0..reset_cycles {
+			// Enter reset: clear CRST, wait until it reads 0.
+			self.regs.gctl.writef(CRST, false);
+			let mut entered = false;
+			for _ in 0..10000 {
+				if ! self.regs.gctl.readf(CRST) { entered = true; break; }
+				super::delay_us(10);
 			}
-			super::delay_us(10);
-		}
 
-		// Mandatory 100us delay after entering reset (HDA spec 4.2.2)
-		super::delay_us(100);
+			// Hold in reset ~1ms so the link fully stops and the codec sees a
+			// real link reset (HDA spec 4.2.2 requires >=100us minimum).
+			super::delay_us(1000);
 
-		// Set CRST bit to exit reset
-		self.regs.gctl.writef(CRST, true);
-
-		// Poll until CRST reads 1 (reset complete), with 10us delays
-		// Timeout after 10000 iterations (~100ms)
-		for _ in 0..10000 {
-			if self.regs.gctl.readf(CRST) {
-				break;
+			// Exit reset: set CRST, wait until it reads 1.
+			self.regs.gctl.writef(CRST, true);
+			let mut exited = false;
+			for _ in 0..10000 {
+				if self.regs.gctl.readf(CRST) { exited = true; break; }
+				super::delay_us(10);
 			}
-			super::delay_us(10);
+
+			// Let the link stabilize before the next cycle / codec discovery.
+			super::delay_us(1000);
+			flog!("reset_controller(): CRST cycle {} entered={} exited={} GCTL={:#X}",
+				cycle, entered, exited, self.regs.gctl.read());
 		}
 
 		// Clear SSYNC - some AMD controllers leave bits set after reset,
-		// which prevents stream DMA from running even with RUN=1.
-		let ssync_before = self.regs.ssync.read();
-		self.regs.ssync.write(0);
-		flog!("reset_controller(): SSYNC before={:#010X} after={:#010X}", ssync_before, self.regs.ssync.read());
+		// which prevents stream DMA from running even with RUN=1 (quirk-gated).
+		if self.quirks.clear_ssync_after_reset {
+			let ssync_before = self.regs.ssync.read();
+			self.regs.ssync.write(0);
+			flog!("reset_controller(): SSYNC before={:#010X} after={:#010X}", ssync_before, self.regs.ssync.read());
+		}
 
 		// Wait for codec discovery - spec requires minimum 521us,
 		// but real hardware (especially AMD) may need up to 2ms
@@ -1024,7 +1068,7 @@ impl IntelHDA {
 
 		let statests = self.regs.statests.read();
 		flog!("reset_controller(): STATESTS={:#06X}", statests);
-		println!("Statests: {:04X}", statests);
+		crate::ihd_println!("Statests: {:04X}", statests);
 
 		for i in 0..15 {
 			if (statests >> i) & 0x1 == 1 {
@@ -1033,8 +1077,85 @@ impl IntelHDA {
 			}
 		}
 		flog!("  codecs found: {:?}", self.codecs);
+
+		// Post-reset link liveness: confirm the controller actually came out of
+		// reset (GCTL.CRST=1) and the link BCLK is running (WALCLK advances).
+		// On the stuck post-power-off boot this distinguishes "reset never
+		// completed" from "reset OK but DMA wedged downstream".
+		{
+			let gctl = self.regs.gctl.read();
+			let w0 = self.regs.walclk.read();
+			super::delay_us(1000);
+			let w1 = self.regs.walclk.read();
+			flog!("reset_controller(): post-reset GCTL={:#X}(CRST={}) WALCLK {:#X}->{:#X}(alive={})",
+				gctl, gctl & 1, w0, w1, w1 != w0);
+		}
 		true
 
+	}
+
+	/// Quiesce the controller cleanly so a subsequent OS (Linux loaded
+	/// by GRUB, etc.) finds it in a fresh-reset state and can re-initialize
+	/// it from scratch without inheriting in-flight DMA, pending IRQs, or
+	/// running CORB/RIRB engines from the firmware-phase driver.
+	///
+	/// - Stops every stream DMA engine (input, output, bidirectional).
+	/// - Halts CORB and RIRB DMA.
+	/// - Zeroes the DMA position pointer.
+	/// - Masks all controller interrupts.
+	/// - Drives GCTL.CRST = 0 and leaves the controller in reset.
+	///
+	/// After `shutdown()` the `IntelHDA` instance must not be used again;
+	/// the next consumer of the device is expected to take it from cold.
+	pub fn shutdown(&mut self) {
+		flog!("IntelHDA::shutdown(): tearing down for OS handoff");
+
+		let gcap = self.regs.gcap.read();
+		let iss = ((gcap >> 8) & 0xF) as usize;
+		let oss = ((gcap >> 12) & 0xF) as usize;
+		let bss = ((gcap >> 3) & 0xF) as usize;
+
+		// Stop every stream DMA engine and acknowledge any pending interrupts.
+		// Stream descriptors are laid out contiguously starting at base+0x80:
+		// input streams, then output streams, then bidirectional streams.
+		for i in 0..(iss + oss + bss) {
+			unsafe {
+				let sd = &mut *((self.base + 0x80 + i * 0x20) as *mut StreamDescriptorRegs);
+				sd.set_control(0);
+				sd.clear_interrupts();
+			}
+		}
+
+		// Stop CORB and RIRB.
+		self.regs.corbctl.write(0);
+		self.regs.rirbctl.write(0);
+
+		// Mask all interrupts so a stale IRQ doesn't fire mid-handoff.
+		self.regs.intctl.write(0);
+		self.regs.intsts.write(0xFFFF_FFFF);
+
+		// Drop the DMA position buffer pointer.
+		self.regs.dplbase.write(0);
+		self.regs.dpubase.write(0);
+
+		// Clear SSYNC so no stream stays gated across the handoff.
+		self.regs.ssync.write(0);
+
+		super::delay_us(200);
+
+		// Enter reset and stay there. The OS will exit reset itself.
+		self.regs.gctl.writef(CRST, false);
+		for _ in 0..10000 {
+			if !self.regs.gctl.readf(CRST) { break; }
+			super::delay_us(10);
+		}
+
+		// Ack all wake/state-change latches so the next owner sees a clean slate.
+		self.regs.statests.write(0xFFFF);
+
+		flog!("IntelHDA::shutdown(): done (GCTL={:#X} INTCTL={:#X})",
+			self.regs.gctl.read(), self.regs.intctl.read());
+		super::filelog::flush();
 	}
 
 	pub fn num_output_streams(&self) -> usize{
@@ -1059,11 +1180,11 @@ impl IntelHDA {
 
 	pub fn info(&self) {
 		//log::info!("Intel HD Audio Version {}.{}", self.regs.vmaj.read(), self.regs.vmin.read());
-		//println!("IHDA: Input Streams: {}", self.num_input_streams());
-		//println!("IHDA: Output Streams: {}", self.num_output_streams());
-		//println!("IHDA: Bidirectional Streams: {}", self.num_bidirectional_streams());
-		//println!("IHDA: Serial Data Outputs: {}", self.num_serial_data_out());
-		//println!("IHDA: 64-Bit: {}", self.regs.gcap.read() & 1 == 1);
+		//crate::ihd_println!("IHDA: Input Streams: {}", self.num_input_streams());
+		//crate::ihd_println!("IHDA: Output Streams: {}", self.num_output_streams());
+		//crate::ihd_println!("IHDA: Bidirectional Streams: {}", self.num_bidirectional_streams());
+		//crate::ihd_println!("IHDA: Serial Data Outputs: {}", self.num_serial_data_out());
+		//crate::ihd_println!("IHDA: 64-Bit: {}", self.regs.gcap.read() & 1 == 1);
 	}
 
 	fn get_input_stream_descriptor(&self, index: usize) -> Option<&'static mut StreamDescriptorRegs> {
@@ -1098,6 +1219,40 @@ impl IntelHDA {
 							index * 0x20) as *mut StreamDescriptorRegs))
 			}else{
 				None
+			}
+		}
+	}
+
+	/// Current DMA playback position (in bytes from the start of the cyclic
+	/// ring) for output stream `index`, read from whichever source the
+	/// chipset's quirk profile says is reliable.
+	///
+	/// - [`PositionSource::LinkPosition`] reads the `SDnLPIB` MMIO register
+	///   directly (AMD).
+	/// - [`PositionSource::DmaPositionBuffer`] reads the controller-written
+	///   DMA Position Buffer entry for this stream from host memory (Intel —
+	///   `SDnLPIB` is unreliable there). The buffer holds one 8-byte entry
+	///   per stream, in global stream order (input streams first), with the
+	///   link position in the low 32 bits.
+	///
+	/// Returns 0 if the stream descriptor / position buffer isn't available,
+	/// which the ring backpressure treats as "DMA at block 0".
+	fn playback_position(&self, index: u8) -> u32 {
+		match self.quirks.position_source {
+			PositionSource::LinkPosition => {
+				self.get_output_stream_descriptor(index as usize)
+					.map(|o| o.link_position())
+					.unwrap_or(0)
+			}
+			PositionSource::DmaPositionBuffer => {
+				if self.dma_pos_addr == 0 {
+					return 0;
+				}
+				let dpib_off = (self.num_input_streams() + index as usize) * 8;
+				super::cache_flush_region(self.dma_pos_addr + dpib_off, 8);
+				unsafe {
+					core::ptr::read_volatile((self.dma_pos_addr + dpib_off) as *const u32)
+				}
 			}
 		}
 	}
@@ -1146,6 +1301,12 @@ impl IntelHDA {
 	}
 
 	pub fn write_to_output(&mut self, index:u8, buf: &[u8]) -> Result<Option<usize>> {
+		// Read the DMA position from the chipset's reliable source FIRST
+		// (SDLPIB on AMD, the DMA Position Buffer on Intel) — before borrowing
+		// output_streams mutably. On Intel this is the difference between the
+		// ring appearing to drain and the queue wedging forever.
+		let pos = self.playback_position(index) as usize;
+
 		let output = self.get_output_stream_descriptor(index as usize).unwrap();
 		let os = self.output_streams.get_mut(index as usize).unwrap();
 
@@ -1153,7 +1314,7 @@ impl IntelHDA {
 		// AMD controllers may gate DMA progress on interrupt acknowledgment.
 		output.clear_interrupts();
 
-		let open_block = (output.link_position() as usize) / os.block_size();
+		let open_block = pos / os.block_size();
 
 		if os.current_block() == (open_block + 3) % NUM_SUB_BUFFS {
 			// Block if we already are 3 buffers ahead
@@ -1172,7 +1333,7 @@ impl IntelHDA {
 	/// Must be called before any write_to_output() or pin testing.
 	pub fn setup_output_stream(&mut self) {
 		flog!("setup_output_stream() starting");
-		println!("Setting up output stream DMA...");
+		crate::ihd_println!("Setting up output stream DMA...");
 
 		self.update_sound_buffers();
 
@@ -1195,10 +1356,34 @@ impl IntelHDA {
 		}
 		super::cache_flush_region(self.dma_pos_addr, 0x1000);
 		let dp_dev = self.dma_pos_dev as u64;
-		self.regs.dplbase.write(((dp_dev & 0xFFFF_FF80) as u32) | 1); // bit0 = enable
-		self.regs.dpubase.write((dp_dev >> 32) as u32);
-		flog!("DMA position buffer host={:#X} device={:#X} DPLBASE={:#010X} DPUBASE={:#010X}",
-			self.dma_pos_addr, dp_dev, self.regs.dplbase.read(), self.regs.dpubase.read());
+		match self.quirks.position_source {
+			// AMD (POS_FIX_FIFO): do NOT enable the DMA Position Buffer.
+			// Linux's AMD path never uses it; it reads SDLPIB directly (as we
+			// do via link_position()). The position buffer requires the DMA
+			// engine to device->memory WRITE the link position continuously
+			// starting at RUN. After a power-off mid-DMA that write is wedged,
+			// so the engine never fills its FIFO (SD_STS FIFO_READY=0x20 never
+			// sets) and SDLPIB stays 0 forever — exactly our stuck-boot
+			// signature. Leaving DPLBASE disabled removes that device->memory
+			// write dependency from stream startup.
+			PositionSource::LinkPosition => {
+				self.regs.dplbase.write(0);
+				self.regs.dpubase.write(0);
+				flog!("DMA position buffer DISABLED (AMD POS_FIX_FIFO; using SDLPIB). host={:#X} device={:#X} DPLBASE={:#010X}",
+					self.dma_pos_addr, dp_dev, self.regs.dplbase.read());
+			}
+			// Intel (POS_FIX_POSBUF): enable the DMA Position Buffer and read
+			// playback position from it — SDLPIB is unreliable on Intel PCH
+			// (Skylake .. Alder Lake / 12th gen). DPLBASE bit 0 is the DMA
+			// Position Buffer Enable (DPBE); the base must be 128-byte aligned.
+			PositionSource::DmaPositionBuffer => {
+				let aligned = dp_dev & !0x7F;
+				self.regs.dplbase.write(((aligned & 0xFFFF_FFFF) as u32) | 1);
+				self.regs.dpubase.write((aligned >> 32) as u32);
+				flog!("DMA position buffer ENABLED (Intel POS_FIX_POSBUF). host={:#X} device={:#X} DPLBASE={:#010X} DPUBASE={:#010X}",
+					self.dma_pos_addr, dp_dev, self.regs.dplbase.read(), self.regs.dpubase.read());
+			}
+		}
 
 		let bdl_dev = self.buff_desc_dev;
 		flog!("BDL base host={:#X} device={:#X}", self.buff_desc_phys, bdl_dev);
@@ -1206,7 +1391,10 @@ impl IntelHDA {
 		let output = self.get_output_stream_descriptor(0).unwrap();
 
 		// Reset stream before configuration (required for real hardware)
-		output.reset();
+		let ctl_pre_srst = output.control();
+		let (srst_asserted, srst_cleared) = output.reset();
+		flog!("  stream SRST: CTL before={:#X} after={:#X} asserted={} cleared={}",
+			ctl_pre_srst, output.control(), srst_asserted, srst_cleared);
 
 		// SDnBDPL/U is read by the controller's DMA engine -> DEVICE address.
 		output.set_address(bdl_dev);
@@ -1233,31 +1421,49 @@ impl IntelHDA {
 			self.regs.ssync.write(0);
 		}
 
-		// Robust stream start. On this AMD controller simply setting RUN is
-		// unreliable (POS stays 0, no error) — the DMA sometimes won't begin
-		// transferring. Use the HDA SSYNC gate/release sequence (set the
-		// stream's SSYNC bit, set RUN, then clear SSYNC to release) and verify
-		// POS actually advances, retrying a few times.
+		// Stream start. The strategy is chipset-specific (see super::quirks):
+		//  - AMD (SsyncGated): simply setting RUN is unreliable (POS stays 0,
+		//    no error) — the DMA sometimes won't begin transferring. Gate the
+		//    stream via SSYNC, set RUN, then release the gate, and retry until
+		//    the position advances.
+		//  - Intel (Plain): a bare RUN is correct.
+		// Either way, verify the playback position advances, read from the
+		// quirk's position source (SDLPIB on AMD, the DMA Position Buffer on
+		// Intel — see playback_position). WALCLK (the controller's global
+		// 24MHz wall clock, ticking whenever the link BCLK runs) is sampled
+		// alongside so a stuck start tells us whether the link clock is alive.
 		let ssync_bit: u32 = 1 << self.num_input_streams(); // output stream 0 descriptor index
 		let mut started = false;
-		for attempt in 0..6u32 {
+		let attempts = match self.quirks.stream_start {
+			StreamStart::SsyncGated => 6u32,
+			StreamStart::Plain => 3u32,
+		};
+		for attempt in 0..attempts {
 			output.stop();
 			output.clear_interrupts();
 			super::delay_us(300);
 
-			// Gate this stream, set RUN, then release the gate.
-			self.regs.ssync.write(self.regs.ssync.read() | ssync_bit);
-			super::delay_us(50);
-			output.run();
-			super::delay_us(100);
-			self.regs.ssync.write(self.regs.ssync.read() & !ssync_bit);
+			match self.quirks.stream_start {
+				StreamStart::SsyncGated => {
+					// Gate this stream, set RUN, then release the gate.
+					self.regs.ssync.write(self.regs.ssync.read() | ssync_bit);
+					super::delay_us(50);
+					output.run();
+					super::delay_us(100);
+					self.regs.ssync.write(self.regs.ssync.read() & !ssync_bit);
+				}
+				StreamStart::Plain => {
+					output.run();
+				}
+			}
 
-			// Verify POS advances.
-			let p0 = output.link_position();
+			let p0 = self.playback_position(0);
+			let w0 = self.regs.walclk.read();
 			super::delay_us(3000);
-			let p1 = output.link_position();
-			flog!("  start attempt {}: ssync_bit={:#X} POS {:#X}->{:#X} CTL={:#X} STS={:#X}",
-				attempt, ssync_bit, p0, p1, output.control(), output.status());
+			let p1 = self.playback_position(0);
+			let w1 = self.regs.walclk.read();
+			flog!("  start attempt {}: mode={:?} ssync_bit={:#X} POS {:#X}->{:#X} WALCLK {:#X}->{:#X}(d={}) CTL={:#X} STS={:#X}",
+				attempt, self.quirks.stream_start, ssync_bit, p0, p1, w0, w1, w1.wrapping_sub(w0), output.control(), output.status());
 			if p1 != p0 {
 				started = true;
 				break;
@@ -1265,7 +1471,45 @@ impl IntelHDA {
 		}
 		if !started {
 			flog!("  WARNING: output DMA did not start (POS not advancing) after retries");
-			println!("WARNING: output DMA did not start");
+			crate::ihd_println!("WARNING: output DMA did not start");
+		}
+
+		// === DMA-start root-cause diagnostic. Logged on EVERY run (not just
+		// failures) so a known-good boot gives a baseline to diff the stuck
+		// post-power-off boot against. The combination of signals isolates the
+		// failing layer:
+		//   WALCLK frozen          -> link/BCLK dead (controller not really out
+		//                             of reset) -> reset hardening needed
+		//   WALCLK ticks, codec_vid==0 -> codec link wedged -> codec/AFG reset
+		//   WALCLK ticks, codec ok, SDLPIB==0 & DPIB_mem==0 -> BDL fetch not
+		//                             happening -> stream-descriptor reset / re-arm
+		//   SDLPIB advances but DPIB_mem stays 0 -> device->memory DMA blocked
+		//                             (IOMMU / coherency)
+		{
+			let w0 = self.regs.walclk.read();
+			super::delay_us(1000);
+			let w1 = self.regs.walclk.read();
+			let gctl = self.regs.gctl.read();
+			let intctl = self.regs.intctl.read();
+			let intsts = self.regs.intsts.read();
+			let ssync = self.regs.ssync.read();
+			// device->memory DMA probe: controller-written link position for
+			// this output stream (global index = num_input_streams + 0).
+			let dpib_off = self.num_input_streams() * 8;
+			let dpib_mem = if self.dma_pos_addr != 0 {
+				super::cache_flush_region(self.dma_pos_addr + dpib_off, 8);
+				unsafe { core::ptr::read_volatile((self.dma_pos_addr + dpib_off) as *const u32) }
+			} else { 0xDEAD_BEEF };
+			// codec liveness probe: get vendor/device id from the root node.
+			// cmd12 (ICS path) is timeout-bounded so this can't hang a dead link.
+			let codec_vid = self.cmd.cmd12((0, 0), 0xF00, 0x00);
+			let o = self.get_output_stream_descriptor(0).unwrap();
+			flog!("DIAG dma-start: started={} GCTL={:#X}(CRST={}) WALCLK {:#X}->{:#X}(alive={}) \
+INTCTL={:#X} INTSTS={:#X} SSYNC={:#X} SD_CTL={:#X} SD_STS={:#X} SDLPIB={:#X} DPIB_mem={:#X} codec_vid={:#018X}(alive={})",
+				started, gctl, gctl & 1, w0, w1, w1 != w0,
+				intctl, intsts, ssync, o.control(), o.status(), o.link_position(),
+				dpib_mem, codec_vid, codec_vid != 0);
+			super::filelog::flush();
 		}
 
 		flog!("setup_output_stream() done: CTL={:#X} STS={:#X} POS={:#X}",
@@ -1279,7 +1523,7 @@ impl IntelHDA {
 			flog!("  DMA poll[{}]: POS={:#X} STS={:#X}", poll, pos, sts);
 		}
 
-		println!("Output stream running: CTL={:#X} STS={:#X} POS={:#X}",
+		crate::ihd_println!("Output stream running: CTL={:#X} STS={:#X} POS={:#X}",
 			output.control(), output.status(), output.link_position());
 		super::filelog::flush();
 	}
@@ -1300,7 +1544,11 @@ impl IntelHDA {
 		let total_bytes = os.block_size() * os.block_count();
 		let total_frames = total_bytes / 4; // 16-bit stereo = 4 bytes/frame
 		// Snap to an integer number of periods so the cyclic loop is seamless.
-		let periods = ((freq_hz * total_frames as f64) / 48000.0).round().max(1.0);
+		// `f64::round` lives in std on UEFI (the soft-float runtime brings it
+		// in via core_arch + std). In no_std the same value comes through
+		// the `libm` crate, which is an unconditional dep. Either way the
+		// behaviour is identical — IEEE 754 round-half-away-from-zero.
+		let periods = libm::round((freq_hz * total_frames as f64) / 48000.0).max(1.0);
 		let actual = periods * 48000.0 / total_frames as f64;
 		for i in 0..total_frames {
 			let phase = 2.0 * core::f64::consts::PI * periods * (i as f64) / (total_frames as f64);
@@ -1371,10 +1619,9 @@ impl IntelHDA {
 	/// sample. Without this the start of short clips can be written into ring
 	/// blocks the DMA already passed (missed first letter / clip starts mid-way).
 	pub fn align_write_cursor(&mut self, lead: usize) {
-		let pos = match self.get_output_stream_descriptor(0) {
-			Some(o) => o.link_position() as usize,
-			None => return,
-		};
+		// Use the chipset's reliable position source (SDLPIB on AMD, DMA
+		// Position Buffer on Intel) — read before borrowing output_streams.
+		let pos = self.playback_position(0) as usize;
 		if let Some(o) = self.output_streams.get_mut(0) {
 			let bs = o.block_size().max(1);
 			let nb = o.block_count().max(1);
@@ -1394,6 +1641,20 @@ impl IntelHDA {
 		super::filelog::flush();
 	}
 
+	/// Re-enable DMA on output stream `index` (sets the SDnCTL.RUN bit).
+	/// Pairs with `stop_all_output` for the "halt-DMA-between-utterances"
+	/// pattern used by short-clip TTS callers — instead of flooding the
+	/// cyclic ring with enough silence to overwrite the just-played clip
+	/// before the DMA can loop over it (the `speak_intel_hda` strategy),
+	/// the caller stops DMA at the end of each clip and restarts here
+	/// before pushing the next clip's PCM. Faster end-of-clip cutoff and
+	/// no risk of audible ring-loop residue.
+	pub fn start_output_stream(&mut self, index: u8) {
+		if let Some(o) = self.get_output_stream_descriptor(index as usize) {
+			o.run();
+		}
+	}
+
 	/// Configure a specific pin for audio output.
 	/// Returns the DAC address if a path to a DAC was found, None otherwise.
 	pub fn configure_pin_for_output(&mut self, pin: WidgetAddr) -> Option<WidgetAddr> {
@@ -1403,14 +1664,14 @@ impl IntelHDA {
 			Some(p) => p,
 			None => {
 				flog!("  no path to DAC from {:?}", pin);
-				println!("  No path to DAC from {:02X}:{:02X}", pin.0, pin.1);
+				crate::ihd_println!("  No path to DAC from {:02X}:{:02X}", pin.0, pin.1);
 				return None;
 			}
 		};
 
 		let dac = *path.last().unwrap();
 		flog!("  path={:X?} dac={:02X}:{:02X}", path, dac.0, dac.1);
-		println!("  Path: {:X?}, DAC: {:02X}:{:02X}", path, dac.0, dac.1);
+		crate::ihd_println!("  Path: {:X?}, DAC: {:02X}:{:02X}", path, dac.0, dac.1);
 
 		// Power on all widgets in path
 		for &addr in &path {
@@ -1436,7 +1697,7 @@ impl IntelHDA {
 				self.cmd.cmd12(addr, 0x701, idx as u8);
 				flog!("    set connection select on {:02X}:{:02X} to index {} (-> {:02X}:{:02X})",
 					addr.0, addr.1, idx, next_addr.0, next_addr.1);
-				println!("    conn_sel {:02X}:{:02X} -> idx {} -> {:02X}:{:02X}",
+				crate::ihd_println!("    conn_sel {:02X}:{:02X} -> idx {} -> {:02X}:{:02X}",
 					addr.0, addr.1, idx, next_addr.0, next_addr.1);
 			}
 		}
@@ -1463,8 +1724,21 @@ impl IntelHDA {
 		//   bits 14:8  = NumSteps
 		//   bits 22:16 = StepSize
 		//   bit  31    = Mute Capable
+		// The Audio Function Group node supplies the DEFAULT amp capabilities
+		// for any widget whose "Amp Param Override" bit (widget caps bit 3) is
+		// clear. Such a widget returns 0 for its own F00:0D / F00:12, so we
+		// must read the caps from the AFG instead — otherwise the 0 dB offset
+		// reads as 0 and we'd set the gain to 0 = minimum volume = SILENCE.
+		// (This is exactly what made the IDT 0x111D codec on the Framework
+		// 12th-gen board silent: DAC 0x10 doesn't override, F00:12 = 0.)
+		let afg_nid = {
+			let root = self.cmd.cmd12((path[0].0, 0), 0xF00, 0x04);
+			((root >> 16) & 0xff) as u16
+		};
+
 		for &addr in &path {
 			let caps = self.cmd.cmd12(addr, 0xF00, 0x09);
+			let overrides = (caps & (1 << 3)) != 0; // Amp Param Override
 
 			let left = true;
 			let right = true;
@@ -1473,10 +1747,14 @@ impl IntelHDA {
 
 			// Input amp
 			if (caps & (1 << 1)) != 0 {
-				let in_caps = self.cmd.cmd12(addr, 0xF00, 0x0D);
+				let mut in_caps = self.cmd.cmd12(addr, 0xF00, 0x0D);
+				if in_caps == 0 || !overrides {
+					let afg = self.cmd.cmd12((addr.0, afg_nid), 0xF00, 0x0D);
+					if afg != 0 { in_caps = afg; }
+				}
 				let in_0db = (in_caps & 0x7f) as u8; // Offset = 0dB
 				self.set_amplifier_gain_mute(addr, false, true, left, right, index, mute, in_0db);
-				flog!("    set {:X?} input gain={:#X} (0dB)", addr, in_0db);
+				flog!("    set {:X?} input gain={:#X} (0dB; caps={:#X})", addr, in_0db, in_caps);
 			}
 
 			// Output amp. Attenuate ~40% of the available steps below the 0 dB
@@ -1484,14 +1762,33 @@ impl IntelHDA {
 			// buzzes when driven hard, and TTS needn't be loud). Widgets with
 			// no gain steps (fixed amps) are unaffected.
 			if (caps & (1 << 2)) != 0 {
-				let out_caps = self.cmd.cmd12(addr, 0xF00, 0x12);
+				let mut out_caps = self.cmd.cmd12(addr, 0xF00, 0x12);
+				// Inherit the AFG's amp caps when this widget doesn't override
+				// them (or reports zero) — see the comment above.
+				if out_caps == 0 || !overrides {
+					let afg = self.cmd.cmd12((addr.0, afg_nid), 0xF00, 0x12);
+					if afg != 0 { out_caps = afg; }
+				}
 				let out_0db = (out_caps & 0x7f) as u8;        // Offset = 0 dB step
 				let numsteps = ((out_caps >> 8) & 0x7f) as u8; // gain steps available
-				let attn = ((numsteps as u16 * 2) / 5) as u8;  // 40% of range
-				let gain = out_0db.saturating_sub(attn);
+				// Gain register value per the chipset's output-gain policy
+				// (see super::quirks::OutputGain): the AMD speaker buzzes hard
+				// so it keeps headroom below 0 dB; the Intel 12th-gen speaker
+				// is barely audible so it runs at the amp maximum.
+				let gain = match self.quirks.output_gain {
+					OutputGain::Max => numsteps,
+					OutputGain::ZeroDb => out_0db,
+					OutputGain::AttenuatePct(p) => {
+						let attn = ((numsteps as u16 * p as u16) / 100) as u8;
+						out_0db.saturating_sub(attn)
+					}
+					OutputGain::PctOfMax(p) => {
+						((numsteps as u16 * p as u16) / 100) as u8
+					}
+				};
 				self.set_amplifier_gain_mute(addr, true, false, left, right, index, mute, gain);
-				flog!("    set {:X?} output gain={:#X} (0dB={:#X} steps={} attn={})",
-					addr, gain, out_0db, numsteps, attn);
+				flog!("    set {:X?} output gain={:#X} (policy={:?} 0dB={:#X} steps={} caps={:#X} afg_nid={:#X})",
+					addr, gain, self.quirks.output_gain, out_0db, numsteps, out_caps, afg_nid);
 			}
 		}
 
@@ -1518,7 +1815,7 @@ impl IntelHDA {
 			if let Some(mix) = mixer_nid {
 				let mix_addr: WidgetAddr = (pin.0, mix);
 				flog!("  Realtek fixup: configuring mixer {:02X}:{:02X}", mix_addr.0, mix_addr.1);
-				println!("  Realtek fixup: configuring mixer {:02X}:{:02X}", mix_addr.0, mix_addr.1);
+				crate::ihd_println!("  Realtek fixup: configuring mixer {:02X}:{:02X}", mix_addr.0, mix_addr.1);
 
 				// Power on the mixer
 				self.set_power_state(mix_addr, 0);
@@ -1542,7 +1839,7 @@ impl IntelHDA {
 		super::filelog::flush();
 
 		// Leak the path Vec to avoid potential drop crash in UEFI
-		std::mem::forget(path);
+		core::mem::forget(path);
 
 		Some(dac)
 	}
@@ -1643,13 +1940,13 @@ impl IntelHDA {
 	}
 
 	fn validate_path(&mut self, path: &Vec<&str>) -> bool {
-		println!("Path: {:?}", path);
+		crate::ihd_println!("Path: {:?}", path);
 		let mut it = path.iter();
 		match it.next() {
 			Some(card_str) if (*card_str).starts_with("card") => {
 				match usize::from_str_radix(&(*card_str)[4..], 10) {
 					Ok(card_num) => {
-						println!("Card# {}", card_num);
+						crate::ihd_println!("Card# {}", card_num);
 						match it.next() {
 							Some(codec_str) if (*codec_str).starts_with("codec#") => {
 								match usize::from_str_radix(&(*codec_str)[6..], 10) {
@@ -1665,7 +1962,7 @@ impl IntelHDA {
 							Some(pcmout_str) if (*pcmout_str).starts_with("pcmout") => {
 								match usize::from_str_radix(&(*pcmout_str)[6..], 10) {
 									Ok(pcmout_num) => {
-										println!("pcmout {}", pcmout_num);
+										crate::ihd_println!("pcmout {}", pcmout_num);
 										true
 									},
 									_ => false,
@@ -1674,7 +1971,7 @@ impl IntelHDA {
 							Some(pcmin_str) if (*pcmin_str).starts_with("pcmin") => {
 								match usize::from_str_radix(&(*pcmin_str)[6..], 10) {
 									Ok(pcmin_num) => {
-										println!("pcmin {}", pcmin_num);
+										crate::ihd_println!("pcmin {}", pcmin_num);
 										true
 									},
 									_ => false,

@@ -1,5 +1,5 @@
-use std::fmt;
-use std::mem::transmute;
+use core::fmt;
+use core::mem::transmute;
 
 pub type HDANodeAddr = u16;
 pub type HDACodecAddr = u8;
