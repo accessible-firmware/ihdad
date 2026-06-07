@@ -22,6 +22,10 @@ const RIRBWPRST: u16 = 1 << 15;
 const RINTCTL: u8 = 1 << 0; // 1 bit
 const RIRBDMAEN: u8 = 1 << 1; // 1 bit
 
+// RIRBSTS (RW1C — write 1 to clear)
+const RINTFL: u8 = 1 << 0; // Response Interrupt Flag
+const RIRBOIS: u8 = 1 << 2; // Response Overrun Interrupt Status
+
 const CORB_OFFSET: usize = 0x00;
 const RIRB_OFFSET: usize = 0x10;
 const ICMD_OFFSET: usize = 0x20;
@@ -75,7 +79,7 @@ struct Corb {
 
 impl Corb {
     pub fn new(regs_addr: usize, corb_buff_phys: usize, corb_buff_virt: usize) -> Corb {
-        println!("regs addr {:x}", regs_addr);
+        crate::ihd_println!("regs addr {:x}", regs_addr);
         unsafe {
             Corb {
                 regs: &mut *(regs_addr as *mut CorbRegs),
@@ -199,7 +203,7 @@ impl Corb {
                 drain_iters = i;
                 flog!("CORB: TIMEOUT waiting for commands to finish (wp={:#X} rp={:#X})",
                     self.regs.corbwp.read(), self.regs.corbrp.read());
-                println!("CORB: timeout waiting for commands to finish");
+                crate::ihd_println!("CORB: timeout waiting for commands to finish");
             }
         }
         if drain_iters > 0 {
@@ -225,7 +229,7 @@ impl Corb {
         self.regs.corbwp.write(write_pos as u16);
         flog!("  CORB post: WP={:#06X} RP={:#06X}", self.regs.corbwp.read(), self.regs.corbrp.read());
 
-        println!("Corb: {:08X}", cmd);
+        crate::ihd_println!("Corb: {:08X}", cmd);
     }
 }
 
@@ -365,7 +369,7 @@ impl Rirb {
                 timed_out = true;
                 flog!("RIRB: TIMEOUT waiting for response (wp={:#X} rp={:#X})",
                     self.regs.rirbwp.read(), self.rirb_rp);
-                println!("RIRB: timeout waiting for response");
+                crate::ihd_println!("RIRB: timeout waiting for response");
             }
         }
         let exit_rirbwp = self.regs.rirbwp.read();
@@ -402,7 +406,15 @@ impl Rirb {
                 self.regs.rirbsts.read(), self.regs.rirbctl.read());
         }
 
-        println!("Rirb: {:08X}", res);
+        // Acknowledge RINTFL (and any RIRBOIS) so the controller will
+        // process the next CORB command. RIRBSTS is RW1C: write a 1 to
+        // the bits we want to clear. With RINTCNT=1 the controller
+        // raises RINTFL on every response; QEMU enforces the spec
+        // strictly and stalls CORB processing until we clear it.
+        // (Real silicon is forgiving — but the spec is the spec.)
+        self.regs.rirbsts.write(RINTFL | RIRBOIS);
+
+        crate::ihd_println!("Rirb: {:08X}", res);
         res
     }
 }
@@ -437,7 +449,7 @@ impl ImmediateCommand {
             super::delay_us(10);
             if i == 9999 {
                 flog!("ICS: TIMEOUT waiting for ready");
-                println!("ICS: timeout waiting for ready");
+                crate::ihd_println!("ICS: timeout waiting for ready");
             }
         }
 
@@ -455,7 +467,7 @@ impl ImmediateCommand {
             super::delay_us(10);
             if i == 9999 {
                 flog!("ICS: TIMEOUT waiting for IRV");
-                println!("ICS: timeout waiting for IRV");
+                crate::ihd_println!("ICS: timeout waiting for IRV");
             }
         }
 
