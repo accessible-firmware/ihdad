@@ -1,15 +1,15 @@
 //use syscall::PAGE_SIZE;
 //use syscall::error::{Error, EIO, Result};
 //use syscall::io::{Mmio, Io};
-use std::result;
-use std::alloc::alloc;
-use std::alloc::dealloc;
-use std::alloc::Layout;
-use std::io::Error;
-use std::io::ErrorKind;
-use std::cmp::min;
-use std::ptr::copy_nonoverlapping;
-use std::ptr;
+use core::result;
+use alloc::alloc::alloc;
+use alloc::alloc::dealloc;
+use core::alloc::Layout;
+use crate::io_compat::Error;
+use crate::io_compat::ErrorKind;
+use core::cmp::min;
+use core::ptr::copy_nonoverlapping;
+use core::ptr;
 use super::io::Mmio;
 use super::io::Io;
 
@@ -164,32 +164,40 @@ impl StreamDescriptorRegs {
 	/// Reset stream descriptor per HDA spec section 3.3.35.
 	/// Must be called before configuring a stream to ensure it's in a
 	/// known state. Firmware may have left streams partially configured.
-	pub fn reset(&mut self) {
+	///
+	/// Returns `(asserted, cleared)`: whether SRST read back as 1 after being
+	/// asserted, and back as 0 after being cleared. If the stream DMA engine is
+	/// wedged (e.g. after a power-off mid-transfer) SRST may not be honored, so
+	/// the caller can log these to detect that.
+	pub fn reset(&mut self) -> (bool, bool) {
 		// 1. Set SRST bit (bit 0 of control register)
 		let ctrl = self.control();
 		self.set_control((ctrl & !0x2) | 0x1); // Set SRST, clear RUN
 
-		// 2. Poll until SRST reads back as 1 (acknowledged)
-		// Timeout after 10ms (1000 iterations * 10us)
+		// 2. Poll until SRST reads back as 1 (acknowledged).
+		// Hold SRST asserted well past the spec minimum so a wedged AMD DMA
+		// engine fully quiesces. Timeout after ~10ms (1000 * 10us).
+		let mut asserted = false;
 		for _ in 0..1000 {
-			if self.control() & 0x1 != 0 {
-				break;
-			}
+			if self.control() & 0x1 != 0 { asserted = true; break; }
 			super::delay_us(10);
 		}
+		super::delay_us(300);
 
 		// 3. Clear SRST bit
 		let ctrl = self.control();
 		self.set_control(ctrl & !0x1);
 
-		// 4. Poll until SRST reads back as 0 (reset complete)
-		// Timeout after 10ms (1000 iterations * 10us)
+		// 4. Poll until SRST reads back as 0 (reset complete).
+		// Timeout after ~10ms (1000 * 10us).
+		let mut cleared = false;
 		for _ in 0..1000 {
-			if self.control() & 0x1 == 0 {
-				break;
-			}
+			if self.control() & 0x1 == 0 { cleared = true; break; }
 			super::delay_us(10);
 		}
+		super::delay_us(300);
+
+		(asserted, cleared)
 	}
 
 	pub fn run(&mut self) {
