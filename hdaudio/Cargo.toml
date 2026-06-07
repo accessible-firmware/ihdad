@@ -3,31 +3,81 @@ name = "ihdad"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# By default the library compiles as no_std + alloc so the code can be
+# statically archived into freestanding consumers that emit ELF (e.g. a
+# GRUB module). The `std` feature re-enables the historical UEFI-std build
+# path — `feature(uefi_std)`, std::io::Result for errors, std::println!
+# for diagnostics, std::sync::Mutex, std::os::uefi::env::system_table()
+# for EFI globals, std::fs-based file logging. The `binary` feature builds
+# the `ihdad.efi` standalone binary from src/main.rs (which itself needs
+# std AND the Redox-style driver-interface deps).
+#
+# Default is "std, binary, chipset-all" so `cargo build --target
+# x86_64-unknown-uefi` continues to produce the standalone EFI app unchanged,
+# with quirk support for every chipset we ship on.
+default = ["std", "binary", "chipset-all"]
+std = []
+
+# --- Per-chipset quirk profiles (see src/hda/quirks.rs) ---
+#
+# Each feature compiles in one chipset family's controller workarounds and
+# its runtime detection arm. Enable a SINGLE one to ship a driver locked to
+# that board (no foreign-chipset branches); enable `chipset-all` — the
+# default, and what `--all-features` gives — to ship ONE generic binary that
+# detects the chipset from its PCI ids at runtime and applies the right
+# profile. Anything unmatched falls back to the spec-conservative baseline.
+chipset-all = ["chipset-amd-gen1", "chipset-intel-12thgen"]
+# AMD Framework 13 (first gen / Phoenix): robust double-reset, SSYNC-gated
+# stream start, SDLPIB position (POS_FIX_FIFO), AFG function-reset recovery.
+chipset-amd-gen1 = []
+# Intel 12th-gen PCH (Alder Lake): DMA Position Buffer (POS_FIX_POSBUF, since
+# SDLPIB is unreliable on Intel), plain stream start, single spec reset.
+chipset-intel-12thgen = []
+binary = [
+    "std",
+    # Deps reachable only via the binary's `pcid::driver_interface` /
+    # `pcid::config` modules and main.rs itself. They all expect std and
+    # are not no_std-portable, so they're optional and pulled in via
+    # this feature instead of being always-on.
+    "dep:flite-uefi",
+    "dep:crossbeam",
+    "dep:bincode",
+    "dep:lazy_static",
+    "dep:thiserror",
+    "dep:serde_json",
+    "dep:toml",
+    "dep:paw",
+    "dep:fry",
+]
+
+[[bin]]
+name = "ihdad"
+path = "src/main.rs"
+required-features = ["binary"]
+
 [dependencies]
-bitflags = "1"
-log = "0.4"
-#redox-daemon = "0.1"
-#redox-log = "0.1"
-#redox_event = { git = "https://gitlab.redox-os.org/redox-os/event.git" }
+# Always-on deps. Each is either no_std-friendly out of the box, or
+# configured here (`default-features = false`) to skip its std code.
+bitflags     = "1"
+log          = { version = "0.4", default-features = false }
 redox_syscall = "0.4"
-spin = "0.9"
+spin         = "0.9"
+common       = { path = "../common" }
+byteorder    = { version = "1.2", default-features = false }
+plain        = "0.2"
+serde        = { version = "1", default-features = false, features = ["derive", "alloc"] }
+smallvec     = { version = "1", default-features = false }
+libm         = "0.2"
+r-efi        = { version = "5", default-features = false }
 
-common = { path = "../common" }
-#pcid = { path = "../pcid" }
-crossbeam = { version = "0.8.2", default-features = false, features = ["crossbeam-channel", "nightly", "alloc", "std"] }
-bincode = "1.2"
-byteorder = "1.2"
-paw = "1.0"
-plain = "0.2"
-#redox-log = "0.1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-smallvec = "1"
-#structopt = { version = "0.3", default-features = false, features = [ "paw" ] }
-thiserror = "1"
-toml = "0.5"
-
-lazy_static = "1.4.0"
-libm = "0.2"
-r-efi = "5"
-fry = "0.0.4"
+# Std-only deps, pulled in only via the `binary` feature.
+flite-uefi   = { path = "/home/tait/Documents/flite/uefi-port/flite-uefi/", optional = true }
+crossbeam    = { version = "0.8.2", default-features = false, features = ["crossbeam-channel", "nightly", "alloc", "std"], optional = true }
+bincode      = { version = "1.2", optional = true }
+lazy_static  = { version = "1.4.0", optional = true }
+thiserror    = { version = "1", optional = true }
+serde_json   = { version = "1", optional = true }
+toml         = { version = "0.5", optional = true }
+paw          = { version = "1.0", optional = true }
+fry          = { version = "0.0.4", optional = true }
