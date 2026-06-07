@@ -1,3 +1,6 @@
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
 use byteorder::{ByteOrder, LittleEndian};
 
 use super::PciDev;

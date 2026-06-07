@@ -5,9 +5,9 @@ use std::{env, io};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
-pub use crate::pci::cap::Capability;
-pub use crate::pci::msi;
-pub use crate::pci::{PciBar, PciHeader};
+pub use crate::pcid::pci::cap::Capability;
+pub use crate::pcid::pci::msi;
+pub use crate::pcid::pci::{PciBar, PciHeader};
 
 pub mod irq_helpers;
 pub mod state;
@@ -237,7 +237,7 @@ pub struct PcidServerHandle {
     pcid_to_client_read: Receiver<Vec<u8>>,
     pcid_from_client_write: Sender<Vec<u8>>,
     pcid_from_client_read: Receiver<Vec<u8>>,
-    drivers: Vec<(Mutex<crate::DriverHandler>, SubdriverArguments)>,
+    drivers: Vec<(Mutex<crate::pcid::driver_interface::state::DriverHandler>, SubdriverArguments)>,
 }
 
 pub fn send<T: Serialize>(w: &mut Sender<Vec<u8>>, message: &T) -> Result<()> {
@@ -271,7 +271,7 @@ impl PcidServerHandle {
         pcid_to_client_read: Receiver<Vec<u8>>,
         pcid_from_client_write: Sender<Vec<u8>>,
         pcid_from_client_read: Receiver<Vec<u8>>,
-        drivers: Vec<(crate::DriverHandler, SubdriverArguments)>,
+        drivers: Vec<(crate::pcid::driver_interface::state::DriverHandler, SubdriverArguments)>,
     ) -> Result<Self> {
         Ok(Self {
             pcid_to_client_write,

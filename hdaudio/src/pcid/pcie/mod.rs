@@ -1,12 +1,31 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use std::{fmt, fs, io, mem, ptr, slice};
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::{fmt, mem, ptr, slice};
+
+// `crate::sync_compat::Mutex` re-exports `std::sync::Mutex` under
+// `feature = "std"` so the existing standalone EFI binary path
+// (`ihdad.efi`) is byte-identical to before. Under `no_std` it's a
+// spin-backed wrapper with the same `.lock().unwrap()` shape.
+use crate::sync_compat::Mutex;
+
+// `std::fs` / `std::io` are only used by `Mcfgs::fetch` to read the
+// Redox-side `acpi:tables` virtual filesystem. That path always fails
+// under UEFI anyway (the fs entry doesn't exist there), and
+// `discover_intel_hda` already handles a failed `Pcie::new()` by
+// falling back to PCI 3.0 port-based config. The fetch body itself
+// therefore lives behind `feature = "std"`; the no_std path just
+// returns an empty `Mcfgs` and we transparently fall back.
+#[cfg(feature = "std")]
+use std::{fs, io};
 
 use syscall::PAGE_SIZE;
 
 use smallvec::SmallVec;
 
-use crate::pci::{CfgAccess, Pci, PciIter};
+use crate::pcid::pci::{CfgAccess, Pci, PciIter};
 
 pub const MCFG_NAME: [u8; 4] = *b"MCFG";
 
@@ -93,7 +112,16 @@ impl Mcfgs {
             .flatten()
     }
 
-    pub fn fetch() -> io::Result<Self> {
+    /// Read all MCFG (PCI Express Memory-Mapped Configuration) ACPI
+    /// tables from the Redox-side `acpi:tables` filesystem.
+    ///
+    /// Under UEFI this filesystem doesn't exist and the call always
+    /// returns an empty set (callers — `discover_intel_hda` in
+    /// particular — react by falling back to PCI 3.0 port-based config
+    /// via the I/O-port `Pci`). The no_std build short-circuits this to
+    /// avoid pulling `std::fs` into the no_std compile.
+    #[cfg(feature = "std")]
+    pub fn fetch() -> crate::io_compat::Result<Self> {
         let table_dir = fs::read_dir("acpi:tables")?;
 
         let tables = table_dir
@@ -119,6 +147,27 @@ impl Mcfgs {
             .collect::<Result<SmallVec<_>, _>>()?;
 
         Ok(Self { tables })
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn fetch() -> crate::io_compat::Result<Self> {
+        // No Redox-style `acpi:tables` filesystem in pre-boot, so we
+        // can't ever populate MCFG tables here. Return an error to
+        // match the std build's behaviour on UEFI: `discover_intel_hda`
+        // does `Pcie::new(..).ok()`, so an Err makes it fall back to
+        // the port-I/O `Pci` cfg accessor — which is what we want.
+        //
+        // Returning Ok(empty) instead caused the GRUB module to read
+        // PCI fine (Pcie::read falls back to Pci) but silently drop
+        // every write (Pcie::write's no-MCFG branch does a read, a
+        // pre-existing bug in this file). That left the HDA Command
+        // register's Memory Space + Bus Master bits never set, so
+        // BAR0 MMIO was inaccessible and `init_intel_hda_auto`
+        // returned NoController.
+        Err(crate::io_compat::Error::new(
+            crate::io_compat::ErrorKind::NotFound,
+            "ihdad: ACPI MCFG tables not available (no_std build)",
+        ))
     }
     pub fn table_and_alloc_at_bus(&self, bus: u8) -> Option<(&Mcfg, &PcieAlloc)> {
         self.tables().find_map(|table| {
@@ -158,7 +207,7 @@ unsafe impl Send for Pcie {}
 unsafe impl Sync for Pcie {}
 
 impl Pcie {
-    pub fn new(fallback: Arc<Pci>) -> io::Result<Self> {
+    pub fn new(fallback: Arc<Pci>) -> crate::io_compat::Result<Self> {
         let mcfgs = Mcfgs::fetch()?;
 
         Ok(Self {
