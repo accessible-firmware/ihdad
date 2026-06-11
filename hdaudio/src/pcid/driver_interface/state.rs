@@ -33,8 +33,6 @@ fn with_pci_func_raw<T, F: FnOnce(&PciFunc) -> T>(
 
 
 
-use std::io::prelude::*;
-
 use std::sync::{Arc, Mutex};
 use std::{thread};
 

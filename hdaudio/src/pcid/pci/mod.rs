@@ -1,5 +1,9 @@
-use std::convert::TryFrom;
-use std::sync::{Mutex, Once};
+use core::convert::TryFrom;
+// `sync_compat` re-exports the real `std::sync::{Mutex, Once}` when the
+// `std` feature is on (so this file is byte-identical to before for the
+// standalone EFI binary). Under `no_std` it provides spin-backed wrappers
+// with the same `.lock().unwrap()` / `.call_once(...)` call patterns.
+use crate::sync_compat::{Mutex, Once};
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use syscall::io::{Io as _, Pio};
@@ -50,7 +54,7 @@ impl Pci {
     fn set_iopl() {
         // make sure that pcid is not granted io port permission unless pcie memory-mapped
         // configuration space is not available.
-        println!("PCI: couldn't find or access PCIe extended configuration, and thus falling back to PCI 3.0 io ports");
+        crate::ihd_println!("PCI: couldn't find or access PCIe extended configuration, and thus falling back to PCI 3.0 io ports");
         // TODO: this seems to cause an immediate exit of the program, but it may be necessray?
         //unsafe {
         //    syscall::iopl(3).expect("pcid: failed to set iopl to 3");

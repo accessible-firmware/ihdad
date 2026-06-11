@@ -1,5 +1,5 @@
-use std::fmt;
-use std::mem::transmute;
+use core::fmt;
+use core::mem::transmute;
 
 pub type HDANodeAddr = u16;
 pub type HDACodecAddr = u8;
@@ -145,10 +145,14 @@ impl ConfigurationDefault {
     }
 
     pub fn geometric_location(&self) -> GeometricLocation {
-        unsafe { transmute(((self.value >> 24) & 0x7) as u8) }
+        unsafe { transmute(((self.value >> 24) & 0xF) as u8) }
     }
 
     pub fn is_output(&self) -> bool {
+        // Pins with no physical connection should never be treated as outputs
+        if matches!(self.port_connectivity(), PortConnectivity::NoPhysicalConnection) {
+            return false;
+        }
         match self.default_device() {
             DefaultDevice::LineOut
             | DefaultDevice::Speaker
@@ -162,6 +166,10 @@ impl ConfigurationDefault {
     }
 
     pub fn is_input(&self) -> bool {
+        // Pins with no physical connection should never be treated as inputs
+        if matches!(self.port_connectivity(), PortConnectivity::NoPhysicalConnection) {
+            return false;
+        }
         match self.default_device() {
             DefaultDevice::ModemHandsetSide
             | DefaultDevice::LineIn

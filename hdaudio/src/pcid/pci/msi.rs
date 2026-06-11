@@ -1,4 +1,4 @@
-use std::fmt;
+use core::fmt;
 
 use super::bar::PciBar;
 pub use super::cap::{MsiCapability, MsixCapability};

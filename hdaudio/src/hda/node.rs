@@ -1,4 +1,7 @@
-use std::{mem, fmt};
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use core::{mem, fmt};
 use super::common::*;
 
 #[derive(Clone, Debug)]
