@@ -1250,9 +1250,23 @@ impl IntelHDA {
 				}
 				let dpib_off = (self.num_input_streams() + index as usize) * 8;
 				super::cache_flush_region(self.dma_pos_addr + dpib_off, 8);
-				unsafe {
+				let dpib = unsafe {
 					core::ptr::read_volatile((self.dma_pos_addr + dpib_off) as *const u32)
+				};
+				// Safety fallback: if the controller isn't writing the position
+				// buffer (0 while the stream is actually running — the wedged-
+				// DPIB case some AMD controllers hit after a power-off), use the
+				// SDnLPIB register instead so we degrade to the old behaviour
+				// rather than wedging the backpressure at position 0 (silence).
+				if dpib == 0 {
+					if let Some(o) = self.get_output_stream_descriptor(index as usize) {
+						let lp = o.link_position();
+						if lp != 0 {
+							return lp;
+						}
+					}
 				}
+				dpib
 			}
 		}
 	}
@@ -1314,10 +1328,25 @@ impl IntelHDA {
 		// AMD controllers may gate DMA progress on interrupt acknowledgment.
 		output.clear_interrupts();
 
-		let open_block = pos / os.block_size();
+		let open_block = pos / os.block_size().max(1);
 
-		if os.current_block() == (open_block + 3) % NUM_SUB_BUFFS {
-			// Block if we already are 3 buffers ahead
+		// How many blocks of un-played audio are buffered ahead of the DMA read
+		// position, measured forward around the cyclic ring. Keep filling until
+		// we're LEAD_BLOCKS ahead. The old code kept only 3 blocks ahead (~31 ms
+		// at 48 kHz stereo) — fine for the continuously-running DMA model, but
+		// the per-utterance stop/restart model runs the WHOLE utterance on that
+		// sliver, so any pump-scheduling jitter over ~31 ms lets the DMA read
+		// pointer lap the write cursor and re-play ~0.34 s-old ring content
+		// (heard as "overlapping"/stuttering audio on the AMD board, whose
+		// SDLPIB-driven backpressure has coarser timing than Intel's DMA
+		// position buffer). Filling most of the ring gives ~0.25 s of slack.
+		// A distance test (not `== open+N`) is robust to the write cursor
+		// overshooting the exact target when `open_block` jumps between calls.
+		const LEAD_BLOCKS: usize = 24; // of NUM_SUB_BUFFS (32); leaves 8 blocks guard
+		let nb = NUM_SUB_BUFFS;
+		let distance = (os.current_block() + nb - (open_block % nb)) % nb;
+		if distance >= LEAD_BLOCKS {
+			// Ring is filled far enough ahead — let the DMA drain first.
 			Ok(None)
 		} else {
 			os.write_block(buf).map(|count| Some(count))
@@ -1650,8 +1679,55 @@ INTCTL={:#X} INTSTS={:#X} SSYNC={:#X} SD_CTL={:#X} SD_STS={:#X} SDLPIB={:#X} DPI
 	/// before pushing the next clip's PCM. Faster end-of-clip cutoff and
 	/// no risk of audible ring-loop residue.
 	pub fn start_output_stream(&mut self, index: u8) {
-		if let Some(o) = self.get_output_stream_descriptor(index as usize) {
-			o.run();
+		match self.quirks.stream_start {
+			// Intel: a bare RUN cleanly resumes the stream. UNCHANGED — this is
+			// exactly the old behaviour, so Intel/QEMU are unaffected.
+			StreamStart::Plain => {
+				if let Some(o) = self.get_output_stream_descriptor(index as usize) {
+					o.run();
+				}
+			}
+			// AMD: a bare RUN after a stop is unreliable — the DMA sometimes
+			// won't resume transferring (POS stays put, no error). The ring
+			// backpressure then mis-tracks (position frozen) and the controller
+			// re-plays stale ring content, which is heard as "overlapping" /
+			// stuttering audio ("re- ready"). Restart with the SAME SSYNC
+			// gate/release + verify sequence that setup_output_stream uses for
+			// the initial cold start (the only sequence proven on AMD silicon).
+			StreamStart::SsyncGated => {
+				let ssync_bit: u32 = 1 << (self.num_input_streams() + index as usize);
+				let mut started = false;
+				for attempt in 0..6u32 {
+					{
+						let o = match self.get_output_stream_descriptor(index as usize) {
+							Some(o) => o,
+							None => return,
+						};
+						o.stop();
+						o.clear_interrupts();
+					}
+					super::delay_us(300);
+					self.regs.ssync.write(self.regs.ssync.read() | ssync_bit);
+					super::delay_us(50);
+					if let Some(o) = self.get_output_stream_descriptor(index as usize) {
+						o.run();
+					}
+					super::delay_us(100);
+					self.regs.ssync.write(self.regs.ssync.read() & !ssync_bit);
+
+					let p0 = self.playback_position(index);
+					super::delay_us(3000);
+					let p1 = self.playback_position(index);
+					flog!("start_output_stream: attempt {} POS {:#X}->{:#X}", attempt, p0, p1);
+					if p1 != p0 {
+						started = true;
+						break;
+					}
+				}
+				if !started {
+					flog!("start_output_stream: WARNING AMD DMA not advancing after retries");
+				}
+			}
 		}
 	}
 

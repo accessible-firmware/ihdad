@@ -149,10 +149,23 @@ impl Quirks {
             double_controller_reset: true,
             clear_ssync_after_reset: true,
             function_reset_afg: true,
-            position_source: PositionSource::LinkPosition,
+            // Use the DMA Position Buffer for the playback position, same as
+            // Intel. SDnLPIB on this AMD controller is too coarse/jittery to
+            // drive the cyclic-ring backpressure reliably: it intermittently
+            // reads ahead, so write_to_output thinks the ring is full and stops
+            // refilling, and the DMA laps the write cursor and replays stale
+            // ring content ("overlapping"/stuttering audio). The DMA Position
+            // Buffer is the controller-written, host-visible position and is the
+            // reliable backpressure source. (setup_output_stream enables DPLBASE
+            // for this profile.)
+            position_source: PositionSource::DmaPositionBuffer,
             stream_start: StreamStart::SsyncGated,
             // AMD Framework speaker buzzes when driven hard → keep headroom.
-            output_gain: OutputGain::AttenuatePct(40),
+            // 25% below the 0 dB reference: on this codec (0 dB at the top of
+            // an 87-step, 0.75 dB/step range) that lands ~15.75 dB below max —
+            // ~10 dB louder than the old 40% (−25.5 dB), still well clear of
+            // the overdrive buzz. Raised for audibility / recording.
+            output_gain: OutputGain::AttenuatePct(25),
             immediate_command_interface: false,
         }
     }
