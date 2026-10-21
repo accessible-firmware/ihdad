@@ -68,7 +68,17 @@ const IRV:      u16 = 1 << 1;
 
 const COMMAND_BUFFER_OFFSET: usize = 0x40;
 
-const NUM_SUB_BUFFS: usize = 32;
+// Cyclic ring geometry. 256 × 2 KiB = 512 KiB = ~2.67 s at 48 kHz stereo
+// 16-bit. The ring was 32 blocks (~0.34 s), but on this Insyde/AMD firmware a
+// single firmware freeze (SMI — likely USB-legacy keyboard handling during
+// menu navigation) can stall the CPU for ~360 ms while the HDA DMA keeps
+// running. If the ring is shorter than that freeze, the DMA laps it and
+// replays already-played audio ("overlapping" speech). 256 blocks is the HDA
+// BDL maximum (LVI max = 255) and tolerates a ~2.6 s freeze — 7× the observed
+// worst case — and lets a typical (<2.6 s) utterance be fully buffered before
+// playback even starts, making it freeze-immune. See hda/trace.rs for the
+// hardware evidence this was sized from.
+const NUM_SUB_BUFFS: usize = 256;
 const SUB_BUFF_SIZE: usize = 2048;
 
 enum Handle {
@@ -1315,6 +1325,10 @@ impl IntelHDA {
 	}
 
 	pub fn write_to_output(&mut self, index:u8, buf: &[u8]) -> Result<Option<usize>> {
+		// Sample the controller's global wall clock first (diagnostics: lets
+		// the write-path trace show the gap between consecutive writes).
+		let walclk = self.regs.walclk.read();
+
 		// Read the DMA position from the chipset's reliable source FIRST
 		// (SDLPIB on AMD, the DMA Position Buffer on Intel) — before borrowing
 		// output_streams mutably. On Intel this is the difference between the
@@ -1342,15 +1356,31 @@ impl IntelHDA {
 		// position buffer). Filling most of the ring gives ~0.25 s of slack.
 		// A distance test (not `== open+N`) is robust to the write cursor
 		// overshooting the exact target when `open_block` jumps between calls.
-		const LEAD_BLOCKS: usize = 24; // of NUM_SUB_BUFFS (32); leaves 8 blocks guard
+		// Fill as much of the ring ahead of the DMA as possible — the deeper
+		// the buffered lead, the longer a firmware freeze (SMI) we survive
+		// before the DMA laps and replays. 250 of 256 leaves a 6-block
+		// (~64 ms) guard so the writer never overwrites the block the DMA is
+		// actively reading.
+		const LEAD_BLOCKS: usize = 250; // of NUM_SUB_BUFFS (256); 6 blocks guard
 		let nb = NUM_SUB_BUFFS;
-		let distance = (os.current_block() + nb - (open_block % nb)) % nb;
-		if distance >= LEAD_BLOCKS {
+		let cur_before = os.current_block();
+		let distance = (cur_before + nb - (open_block % nb)) % nb;
+		let (flag, ret): (u8, Result<Option<usize>>) = if distance >= LEAD_BLOCKS {
 			// Ring is filled far enough ahead — let the DMA drain first.
-			Ok(None)
+			(0, Ok(None))
 		} else {
-			os.write_block(buf).map(|count| Some(count))
-		}
+			match os.write_block(buf) {
+				Ok(count) => (1, Ok(Some(count))),
+				Err(e) => (2, Err(e)),
+			}
+		};
+		// Diagnostics: record this write-path decision. Borrows of
+		// output/os have ended; this only touches the trace static.
+		crate::hda::trace::record(
+			walclk, pos as u32, (open_block % nb) as u8,
+			cur_before as u8, distance as u8, flag,
+		);
+		ret
 	}
 
 	pub fn output_stream_diag(&mut self, index: u8) -> (u32, u8, u32) {

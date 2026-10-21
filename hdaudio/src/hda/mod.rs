@@ -7,6 +7,7 @@ pub mod cmdbuff;
 pub mod io;
 pub mod filelog;
 pub mod quirks;
+pub mod trace;
 
 pub use self::stream::*;
 pub use self::node::*;
